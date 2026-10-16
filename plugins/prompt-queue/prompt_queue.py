@@ -260,6 +260,9 @@ class Herdr:
         else:
             self.request("pane.send_input", {"pane_id": pane_id, "text": text, "keys": ["Enter"]})
 
+    def notify(self, title: str, body: str) -> None:
+        self.request("notification.show", {"title": title, "body": body, "sound": "request"})
+
     def report_count(self, pane_id: str, count: int) -> None:
         value = f"{count} queued" if count else None
         self.request(
@@ -512,17 +515,44 @@ def entry_count(data: dict[str, Any], key: str) -> int:
 
 
 # --------------------------------------------------------------------------
-# Sidebar token cache (non-durable; rebuilt by the startup hook)
+# Pane caches (non-durable; rebuilt by the startup hook)
+
+COUNTS_CACHE = "reported-counts.json"
+PANE_KEYS_CACHE = "pane-keys.json"
+
+# Mirrors the resume commands Herdr uses for official agent integrations.
+RESUME_COMMANDS = {
+    ("herdr:claude", "claude"): "claude --resume {id}",
+    ("herdr:codex", "codex"): "codex resume {id}",
+    ("herdr:copilot", "copilot"): "copilot --resume={id}",
+    ("herdr:devin", "devin"): "devin --resume {id}",
+    ("herdr:droid", "droid"): "droid --resume {id}",
+    ("herdr:kimi", "kimi"): "kimi --session {id}",
+    ("herdr:pi", "pi"): "pi --session {id}",
+    ("herdr:omp", "omp"): "omp --resume={id}",
+}
+
+
+def read_cache(directory: pathlib.Path, name: str) -> dict[str, Any]:
+    try:
+        cache = json.loads((directory / name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def write_cache(directory: pathlib.Path, name: str, cache: dict[str, Any]) -> None:
+    path = directory / name
+    try:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}")
+        temporary.write_text(json.dumps(cache, sort_keys=True))
+        os.replace(temporary, path)
+    except OSError:
+        pass
 
 
 def report_count(herdr: Herdr, directory: pathlib.Path, pane_id: str, count: int) -> None:
-    cache_path = directory / "reported-counts.json"
-    try:
-        cache = json.loads(cache_path.read_text())
-        if not isinstance(cache, dict):
-            cache = {}
-    except (OSError, ValueError):
-        cache = {}
+    cache = read_cache(directory, COUNTS_CACHE)
     # Only clear a token this plugin reported; Herdr drops tokens on restart.
     if cache.get(pane_id, 0) == count:
         return
@@ -531,24 +561,71 @@ def report_count(herdr: Herdr, directory: pathlib.Path, pane_id: str, count: int
     except HerdrError:
         return
     cache[pane_id] = count
-    try:
-        temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}")
-        temporary.write_text(json.dumps(cache, sort_keys=True))
-        os.replace(temporary, cache_path)
-    except OSError:
-        pass
+    write_cache(directory, COUNTS_CACHE, cache)
 
 
-def resolve(herdr: Herdr, pane_id: str) -> Conversation:
+def remember_pane_key(directory: pathlib.Path, conversation: Conversation) -> None:
+    if conversation.session is None:
+        return
+    cache = read_cache(directory, PANE_KEYS_CACHE)
+    if cache.get(conversation.pane_id) != conversation.key:
+        cache[conversation.pane_id] = conversation.key
+        write_cache(directory, PANE_KEYS_CACHE, cache)
+
+
+def resume_hint(queue: dict[str, Any]) -> str | None:
+    session = queue.get("session")
+    if not isinstance(session, dict) or not session.get("value"):
+        return None
+    template = RESUME_COMMANDS.get((session.get("source"), session.get("agent")))
+    return template.format(id=session["value"]) if template else None
+
+
+def warn_if_ended(store: Store, herdr: Herdr, pane_id: str, current_key: str | None) -> bool:
+    """Notify when the conversation last seen in a pane left it with prompts queued.
+
+    `current_key` is the conversation the pane holds now, or None when its agent
+    exited or the pane closed.
+    """
+    cache = read_cache(store.directory, PANE_KEYS_CACHE)
+    previous = cache.get(pane_id)
+    if not previous or previous == current_key:
+        return False
+    del cache[pane_id]
+    write_cache(store.directory, PANE_KEYS_CACHE, cache)
+    queue = queue_for(store.read(), previous)
+    count = len(queue["entries"]) if queue else 0
+    if not count:
+        return False
+    plural = "prompt" if count == 1 else "prompts"
+    title = f"{queue.get('label', 'Conversation')} ended with {count} queued {plural}"
+    hint = resume_hint(queue)
+    body = (
+        f"Resume with: {hint}" if hint else "Move them from another conversation's queue with o."
+    )
     try:
-        return conversation_for_pane(herdr.pane(pane_id))
+        herdr.notify(title, body)
+    except HerdrError:
+        return False
+    return True
+
+
+def resolve(herdr: Herdr, pane_id: str, directory: pathlib.Path | None = None) -> Conversation:
+    try:
+        pane = herdr.pane(pane_id)
     except HerdrError:
         return fallback_conversation(pane_id)
+    conversation = conversation_for_pane(pane)
+    if directory is not None and pane.get("agent"):
+        remember_pane_key(directory, conversation)
+    return conversation
 
 
 def sync_pane(store: Store, herdr: Herdr, pane: dict[str, Any]) -> Conversation:
     """Adopt pane-keyed entries, record where the queue lives, and report its count."""
     conversation = conversation_for_pane(pane)
+    if pane.get("agent"):
+        remember_pane_key(store.directory, conversation)
     with store.transaction() as data:
         adopt_pane_queue(data, conversation)
         queue = queue_for(data, conversation.key)
@@ -727,6 +804,8 @@ class QueueApp:
             pane = self.herdr.pane(self.pane_id)
             self.conversation = conversation_for_pane(pane)
             self.is_agent = bool(pane.get("agent"))
+            if self.is_agent:
+                remember_pane_key(self.store.directory, self.conversation)
         except HerdrError as exc:
             self.conversation = fallback_conversation(self.pane_id)
             self.message = f"Herdr unavailable ({exc.code}); showing the pane queue"
@@ -1114,12 +1193,22 @@ def cmd_hook(args: argparse.Namespace) -> int:
     store = Store(args.state_dir)
     if not store.path.exists():
         return 0
+    event_name = str(event.get("event") or os.environ.get("HERDR_PLUGIN_EVENT") or "")
     herdr = Herdr()
     if data_section.get("agent_status") == "working":
         with store.transaction() as data:
             consume_pending(data, pane_id, time.time())
+    if event_name == "pane.closed":
+        warn_if_ended(store, herdr, pane_id, None)
+        return 0
     try:
-        sync_pane(store, herdr, herdr.pane(pane_id))
+        pane = herdr.pane(pane_id)
+        # Herdr keeps the session binding after the agent exits so it can resume
+        # it, so an agent that left the pane also ends the conversation here.
+        agent_left = event_name == "pane.agent_detected" and not pane.get("agent")
+        current = conversation_for_pane(pane)
+        warn_if_ended(store, herdr, pane_id, None if agent_left else current.key)
+        sync_pane(store, herdr, pane)
     except (HerdrError, QueueError):
         pass
     return 0
@@ -1127,8 +1216,9 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 def cmd_startup(args: argparse.Namespace) -> int:
     store = Store(args.state_dir)
-    with contextlib.suppress(FileNotFoundError):
-        (store.directory / "reported-counts.json").unlink()
+    for name in (COUNTS_CACHE, PANE_KEYS_CACHE):
+        with contextlib.suppress(FileNotFoundError):
+            (store.directory / name).unlink()
     if not store.path.exists():
         return 0
     herdr = Herdr()
@@ -1174,7 +1264,7 @@ def read_text_argument(parts: list[str]) -> str:
 
 def cmd_add(args: argparse.Namespace) -> int:
     store, herdr = Store(args.state_dir), Herdr()
-    conversation = resolve(herdr, target_pane(args))
+    conversation = resolve(herdr, target_pane(args), store.directory)
     text = read_text_argument(args.text)
     with store.transaction() as data:
         adopt_pane_queue(data, conversation)
@@ -1187,7 +1277,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def with_conversation_queue(args: argparse.Namespace, action) -> Any:
     store, herdr = Store(args.state_dir), Herdr()
-    conversation = resolve(herdr, target_pane(args))
+    conversation = resolve(herdr, target_pane(args), store.directory)
     with store.transaction() as data:
         queue = queue_for(data, conversation.key)
         if queue is None:

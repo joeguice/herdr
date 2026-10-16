@@ -64,6 +64,16 @@ Herdr's `working` status is the submit signal. If the agent starts working for
 another reason while an inserted prompt is still unsent, the entry is removed
 anyway; press `u` to bring it back.
 
+### When a conversation ends with prompts queued
+
+Herdr plugins can't intercept an agent's own `/quit` or `/exit`, but quitting
+loses nothing: the queue stays with the conversation's session. When a
+conversation leaves its pane with prompts still queued, the plugin shows a
+Herdr toast (with the needs-attention sound) and the command to resume it,
+such as `claude --resume <id>` or `codex resume <id>`. A conversation leaves
+its pane when the agent exits, the pane closes, or a new session such as
+`/clear` replaces it.
+
 ### From scripts or agents
 
 The same operations are available on the command line, so an agent can queue
