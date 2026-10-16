@@ -15,15 +15,22 @@ Linux or macOS.
 herdr plugin link /path/to/herdr/plugins/prompt-queue
 ```
 
-Bind a key to open the queue for the focused pane in `~/.config/herdr/config.toml`:
+Bind a key to open the queue for the focused pane. Custom command keys belong
+to the Herdr server's `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
-key = "prefix+shift+q"
+key = ["ctrl+q", "prefix+shift+q"]
 type = "plugin_action"
 command = "joeguice.prompt-queue.open"
 description = "prompt queue"
 ```
+
+`ctrl+q` is a direct chord, so programs inside panes no longer receive it; drop
+it from the list if you need it there. Pressing it again inside the popup
+closes the queue. A native client attached with `herdr --remote` only binds
+custom commands when it uses `--remote-keybindings server`. With the default
+`local` keybindings, Herdr does not bind them at all.
 
 To show the count in the Agent sidebar, add the `$queue` token to a row. It
 reads like `3 queued` and disappears when the queue is empty:
@@ -49,7 +56,7 @@ Run `herdr server reload-config` after editing.
 | `p` | Unmark an inserted prompt you decided not to submit |
 | `o` | Other conversations' queues; `enter` moves one into this conversation, `x` twice deletes it |
 | `j` / `k`, arrows, wheel, click | Select |
-| `q` / `esc` | Close |
+| `q` / `esc` / `ctrl+q` | Close |
 
 The inserted text is a normal bracketed paste, so you can edit it in the agent's
 input before pressing Enter. The entry shows ⏳ until the agent starts working.

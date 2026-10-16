@@ -696,8 +696,11 @@ QUEUE_HINTS = [
     ("u", "undo"),
     ("p", "unmark"),
     ("o", "other queues"),
-    ("q", "close"),
+    ("q/ctrl+q", "close"),
 ]
+# ctrl+q toggles the popup closed (it is the suggested open key); ctrl+c also
+# closes because raw mode stops it from interrupting.
+CLOSE_KEYS = ("\x11", "\x03")
 OTHER_HINTS = [("enter", "move into this conversation"), ("x", "delete queue"), ("esc", "back")]
 
 
@@ -944,6 +947,8 @@ class QueueApp:
         import curses
 
         curses.curs_set(0)
+        # Raw mode so ctrl+q (otherwise XON flow control) reaches the popup.
+        curses.raw()
         with contextlib.suppress(curses.error):
             curses.use_default_colors()
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
@@ -968,6 +973,8 @@ class QueueApp:
         """Apply one key press; return True when the popup should close."""
         import curses
 
+        if key in CLOSE_KEYS:
+            return True
         if self.mode == "queue":
             if key in ("q", "\x1b"):
                 return True
