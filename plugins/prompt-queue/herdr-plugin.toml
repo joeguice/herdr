@@ -1,0 +1,34 @@
+id = "joeguice.prompt-queue"
+name = "Prompt queue"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Queue prompts per agent conversation and insert them into the prompt later"
+platforms = ["linux", "macos"]
+
+# Restore sidebar counts after a server restart; pane tokens are not persisted.
+[[startup]]
+command = ["python3", "prompt_queue.py", "startup"]
+
+[[actions]]
+id = "open"
+title = "Open prompt queue"
+contexts = ["pane"]
+command = ["python3", "prompt_queue.py", "open"]
+
+[[panes]]
+id = "queue"
+title = "Prompt queue"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["python3", "prompt_queue.py", "ui"]
+
+# Removes inserted prompts once the agent starts working on them, and keeps the
+# sidebar count current when an agent or its session appears.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "prompt_queue.py", "hook"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "prompt_queue.py", "hook"]
