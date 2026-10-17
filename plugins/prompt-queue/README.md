@@ -48,8 +48,8 @@ Run `herdr server reload-config` after editing.
 | --- | --- |
 | `enter` / `i` / double-click | Insert the selected prompt into the agent's input without submitting it, then close |
 | `s` | Submit the selected prompt now and remove it |
-| `a` | Add a prompt after the selection (opens `$VISUAL`, `$EDITOR`, nano, or vi) |
-| `e` | Edit the selected prompt in the editor |
+| `a` | Add a prompt after the selection |
+| `e` | Edit the selected prompt |
 | `d` / `delete` | Delete the selected prompt |
 | `J` / `K` | Move the selected prompt down / up |
 | `u` | Undo: restore the most recently removed prompt (deleted, sent, or submitted) |
@@ -57,6 +57,11 @@ Run `herdr server reload-config` after editing.
 | `o` | Other conversations' queues; `enter` moves one into this conversation, `x` twice deletes it |
 | `j` / `k`, arrows, wheel, click | Select |
 | `q` / `esc` / `ctrl+q` | Close |
+
+Adding and editing happen in the popup. `esc` saves and returns to the queue;
+`ctrl+c` discards the edit. `enter` starts a new line, and the arrow keys,
+`home`/`end` (or `ctrl+a`/`ctrl+e`), `backspace`, and `delete` move and edit
+as usual. Long lines wrap to the popup width.
 
 The inserted text is a normal bracketed paste, so you can edit it in the agent's
 input before pressing Enter. The entry shows ⏳ until the agent starts working.
@@ -115,13 +120,14 @@ State lives in `~/.local/state/herdr/plugins/joeguice.prompt-queue/`:
   old file, and followed by a directory fsync. Writers serialize on a file lock.
 - `queues.json.bak`: the previous version. If `queues.json` is unreadable, it
   is moved aside as `queues.json.corrupt-*` and the backup is restored.
-- `drafts/`: prompts open in the editor. If the editor session dies, the draft
-  is applied the next time you open that conversation's queue.
+- `drafts/`: prompts being added or edited, saved about once a second while
+  you type. If the popup dies mid-edit, the draft is applied the next time you
+  open that conversation's queue.
 - `reported-counts.json`: a disposable cache of sidebar counts. The startup
   hook rebuilds it.
 
-A Herdr crash, a WSL crash, or a Windows restart loses at most an edit that
-was still open in the editor and never saved.
+A Herdr crash, a WSL crash, or a Windows restart loses at most the last second
+of typing in an open edit.
 
 ## Tests
 
