@@ -27,8 +27,6 @@ import fcntl
 import json
 import os
 import pathlib
-import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -691,38 +689,36 @@ def recover_drafts(store: Store, conversation: Conversation) -> int:
     return recovered
 
 
-def editor_argv() -> list[str]:
-    for name in ("VISUAL", "EDITOR"):
-        value = os.environ.get(name)
-        if value:
-            return shlex.split(value)
-    for candidate in ("nano", "vim", "vi"):
-        if shutil.which(candidate):
-            return [candidate]
-    raise QueueError("no editor found; set $EDITOR")
+class DraftFile:
+    """On-disk copy of an open edit, applied by recover_drafts after a crash."""
 
+    SAVE_INTERVAL_SECONDS = 1.0
 
-def edit_in_editor(store: Store, conversation: Conversation, initial: str, entry_id: str | None) -> str | None:
-    directory = drafts_dir(store)
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    draft_path = directory / f"{stem}.md"
-    meta_path = directory / f"{stem}.json"
-    atomic_write(draft_path, initial.encode())
-    atomic_write(
-        meta_path,
-        json.dumps({"key": conversation.key, "entry_id": entry_id, "pid": os.getpid(), "initial": initial}).encode(),
-    )
-    try:
-        subprocess.call(editor_argv() + [str(draft_path)])
-        text = draft_path.read_text()
-    finally:
-        for path in (draft_path, meta_path):
+    def __init__(self, store: Store, conversation: Conversation, initial: str, entry_id: str | None):
+        directory = drafts_dir(store)
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.text_path = directory / f"{stem}.md"
+        self.meta_path = directory / f"{stem}.json"
+        self.saved = initial
+        self.saved_at = 0.0
+        atomic_write(self.text_path, initial.encode())
+        atomic_write(
+            self.meta_path,
+            json.dumps({"key": conversation.key, "entry_id": entry_id, "pid": os.getpid(), "initial": initial}).encode(),
+        )
+
+    def save(self, text: str, now: float, force: bool = False) -> None:
+        if text == self.saved or (not force and now - self.saved_at < self.SAVE_INTERVAL_SECONDS):
+            return
+        with contextlib.suppress(OSError):
+            atomic_write(self.text_path, text.encode())
+            self.saved, self.saved_at = text, now
+
+    def remove(self) -> None:
+        for path in (self.text_path, self.meta_path):
             with contextlib.suppress(OSError):
                 path.unlink()
-    if not text.strip() or text.strip() == initial.strip():
-        return None
-    return text
 
 
 # --------------------------------------------------------------------------
@@ -761,6 +757,222 @@ def wrap(text: str, width: int) -> list[str]:
             used += size
         lines.append(current)
     return lines
+
+
+def char_width(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+class EditBuffer:
+    """Multi-line prompt text and cursor, independent of curses."""
+
+    def __init__(self, text: str = ""):
+        self.lines = text.split("\n") if text else [""]
+        self.row = len(self.lines) - 1
+        self.col = len(self.lines[-1])
+        self.goal_x: int | None = None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def insert(self, chars: str) -> None:
+        for ch in chars.replace("\r\n", "\n").replace("\r", "\n"):
+            if ch == "\n":
+                self.newline()
+            elif ch == "\t":
+                self.insert("    ")
+            elif unicodedata.category(ch) != "Cc":
+                line = self.lines[self.row]
+                self.lines[self.row] = line[: self.col] + ch + line[self.col :]
+                self.col += 1
+        self.goal_x = None
+
+    def newline(self) -> None:
+        line = self.lines[self.row]
+        self.lines[self.row] = line[: self.col]
+        self.lines.insert(self.row + 1, line[self.col :])
+        self.row += 1
+        self.col = 0
+        self.goal_x = None
+
+    def backspace(self) -> None:
+        if self.col > 0:
+            line = self.lines[self.row]
+            self.lines[self.row] = line[: self.col - 1] + line[self.col :]
+            self.col -= 1
+        elif self.row > 0:
+            self.col = len(self.lines[self.row - 1])
+            self.lines[self.row - 1] += self.lines.pop(self.row)
+            self.row -= 1
+        self.goal_x = None
+
+    def delete(self) -> None:
+        line = self.lines[self.row]
+        if self.col < len(line):
+            self.lines[self.row] = line[: self.col] + line[self.col + 1 :]
+        elif self.row < len(self.lines) - 1:
+            self.lines[self.row] += self.lines.pop(self.row + 1)
+        self.goal_x = None
+
+    def left(self) -> None:
+        if self.col > 0:
+            self.col -= 1
+        elif self.row > 0:
+            self.row -= 1
+            self.col = len(self.lines[self.row])
+        self.goal_x = None
+
+    def right(self) -> None:
+        if self.col < len(self.lines[self.row]):
+            self.col += 1
+        elif self.row < len(self.lines) - 1:
+            self.row += 1
+            self.col = 0
+        self.goal_x = None
+
+    def home(self) -> None:
+        self.col = 0
+        self.goal_x = None
+
+    def end(self) -> None:
+        self.col = len(self.lines[self.row])
+        self.goal_x = None
+
+    def layout(self, width: int) -> list[tuple[int, int, int]]:
+        """Soft-wrap into display rows of (line index, start col, end col)."""
+        width = max(width, 2)
+        rows: list[tuple[int, int, int]] = []
+        for index, line in enumerate(self.lines):
+            start, used = 0, 0
+            for col, ch in enumerate(line):
+                size = char_width(ch)
+                if used + size > width:
+                    rows.append((index, start, col))
+                    start, used = col, 0
+                used += size
+            rows.append((index, start, len(line)))
+        return rows
+
+    def cursor(self, rows: list[tuple[int, int, int]]) -> tuple[int, int]:
+        """Return the cursor's display row and column."""
+        for position, (index, start, end) in enumerate(rows):
+            last_segment = position + 1 == len(rows) or rows[position + 1][0] != index
+            if index == self.row and start <= self.col and (self.col < end or (self.col == end and last_segment)):
+                return position, display_width(self.lines[index][start : self.col])
+        return len(rows) - 1, 0
+
+    def vertical(self, delta: int, width: int) -> None:
+        rows = self.layout(width)
+        position, x = self.cursor(rows)
+        goal = x if self.goal_x is None else self.goal_x
+        target = position + delta
+        if target < 0:
+            self.row, self.col = 0, 0
+        elif target >= len(rows):
+            self.row, self.col = len(self.lines) - 1, len(self.lines[-1])
+        else:
+            index, start, end = rows[target]
+            line = self.lines[index]
+            col, used = start, 0
+            while col < end and used + char_width(line[col]) <= goal:
+                used += char_width(line[col])
+                col += 1
+            last_segment = target + 1 == len(rows) or rows[target + 1][0] != index
+            if col == end and not last_segment and end > start:
+                col = end - 1
+            self.row, self.col = index, col
+        self.goal_x = goal
+
+
+EDITOR_HINTS = [("esc", "save"), ("enter", "new line"), ("ctrl+c", "discard")]
+
+
+def edit_prompt(screen, store: Store, conversation: Conversation, title: str, initial: str, entry_id: str | None) -> str | None:
+    """Edit a prompt in the popup. Esc saves; ctrl+c discards.
+
+    Returns the new text, or None when it was discarded, left empty, or unchanged.
+    """
+    import curses
+
+    buffer = EditBuffer(initial)
+    draft = DraftFile(store, conversation, initial, entry_id)
+    scroll = 0
+    curses.curs_set(1)
+    try:
+        while True:
+            height, width = screen.getmaxyx()
+            text_width = max(width - 2, 2)
+            text_height = max(height - 3, 1)
+            rows = buffer.layout(text_width)
+            position, x = buffer.cursor(rows)
+            scroll = min(max(scroll, position - text_height + 1), position)
+            screen.erase()
+            screen.addstr(0, 0, clip(f" {title} — {conversation.label}", width - 1), curses.A_BOLD)
+            for offset, (index, start, end) in enumerate(rows[scroll : scroll + text_height]):
+                screen.addstr(1 + offset, 1, buffer.lines[index][start:end])
+            hints = "  ".join(f"{key} {label}" for key, label in EDITOR_HINTS)
+            screen.addstr(height - 1, 0, clip(" " + hints, width - 1), curses.A_DIM)
+            screen.move(1 + position - scroll, min(1 + x, width - 1))
+            screen.refresh()
+
+            key = screen.get_wch()
+            # Drain queued input (a paste) before redrawing.
+            screen.nodelay(True)
+            try:
+                while True:
+                    if key in ("\x1b", "\x11"):
+                        return finish_edit(buffer.text, initial)
+                    if key == "\x03":
+                        return None
+                    apply_edit_key(buffer, key, text_width)
+                    try:
+                        key = screen.get_wch()
+                    except curses.error:
+                        break
+            finally:
+                screen.nodelay(False)
+            draft.save(buffer.text, time.time())
+    finally:
+        draft.remove()
+        curses.curs_set(0)
+
+
+def finish_edit(text: str, initial: str) -> str | None:
+    if not text.strip() or text.strip() == initial.strip():
+        return None
+    return text
+
+
+def apply_edit_key(buffer: EditBuffer, key, width: int) -> None:
+    import curses
+
+    if isinstance(key, str):
+        if key in ("\n", "\r"):
+            buffer.newline()
+        elif key in ("\x7f", "\x08"):
+            buffer.backspace()
+        elif key == "\x01":
+            buffer.home()
+        elif key == "\x05":
+            buffer.end()
+        else:
+            buffer.insert(key)
+        return
+    actions = {
+        curses.KEY_ENTER: buffer.newline,
+        curses.KEY_BACKSPACE: buffer.backspace,
+        curses.KEY_DC: buffer.delete,
+        curses.KEY_LEFT: buffer.left,
+        curses.KEY_RIGHT: buffer.right,
+        curses.KEY_HOME: buffer.home,
+        curses.KEY_END: buffer.end,
+        curses.KEY_UP: lambda: buffer.vertical(-1, width),
+        curses.KEY_DOWN: lambda: buffer.vertical(1, width),
+    }
+    action = actions.get(key)
+    if action:
+        action()
 
 
 QUEUE_HINTS = [
@@ -939,18 +1151,8 @@ class QueueApp:
         self.message = "Queue deleted (kept in deleted_queues of queues.json)"
 
     def with_editor(self, screen, initial: str, entry_id: str | None) -> str | None:
-        import curses
-
-        curses.def_prog_mode()
-        curses.endwin()
-        try:
-            return edit_in_editor(self.store, self.conversation, initial, entry_id)
-        except QueueError as exc:
-            self.message = str(exc)
-            return None
-        finally:
-            curses.reset_prog_mode()
-            screen.clear()
+        title = "Edit prompt" if entry_id else "Add prompt"
+        return edit_prompt(screen, self.store, self.conversation, title, initial, entry_id)
 
     # drawing ------------------------------------------------------------
 

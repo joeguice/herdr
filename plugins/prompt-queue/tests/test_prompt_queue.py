@@ -328,6 +328,62 @@ class ConversationEndedTests(CommandTestCase):
         self.assertEqual(len(self.notifications()), 1)
 
 
+class EditBufferTests(unittest.TestCase):
+    def test_typing_newlines_and_backspace_across_lines(self):
+        buffer = pq.EditBuffer()
+        buffer.insert("first\tline\r\nsecond")
+        self.assertEqual(buffer.text, "first    line\nsecond")
+        buffer.home()
+        buffer.backspace()
+        self.assertEqual(buffer.text, "first    linesecond")
+        self.assertEqual((buffer.row, buffer.col), (0, 13))
+        buffer.newline()
+        buffer.end()
+        buffer.delete()
+        buffer.insert("!")
+        self.assertEqual(buffer.text, "first    line\nsecond!")
+
+    def test_editing_existing_text_starts_at_the_end(self):
+        buffer = pq.EditBuffer("a\nbc")
+        self.assertEqual((buffer.row, buffer.col), (1, 2))
+        buffer.left(); buffer.left(); buffer.left()
+        self.assertEqual((buffer.row, buffer.col), (0, 1))
+        buffer.right()
+        self.assertEqual((buffer.row, buffer.col), (1, 0))
+
+    def test_layout_soft_wraps_and_places_the_cursor(self):
+        buffer = pq.EditBuffer("abcdefgh\nxy")
+        rows = buffer.layout(3)
+        self.assertEqual(rows, [(0, 0, 3), (0, 3, 6), (0, 6, 8), (1, 0, 2)])
+        self.assertEqual(buffer.cursor(rows), (3, 2))
+        buffer.row, buffer.col = 0, 3
+        self.assertEqual(buffer.cursor(rows), (1, 0))
+        buffer.row, buffer.col = 0, 8
+        self.assertEqual(buffer.cursor(rows), (2, 2))
+
+    def test_up_and_down_move_through_wrapped_rows_keeping_the_column(self):
+        buffer = pq.EditBuffer("abcdefgh\nxy")
+        buffer.vertical(-1, 3)
+        self.assertEqual((buffer.row, buffer.col), (0, 8))
+        buffer.vertical(-1, 3)
+        self.assertEqual((buffer.row, buffer.col), (0, 5))
+        buffer.vertical(-1, 3)
+        buffer.vertical(-1, 3)
+        self.assertEqual((buffer.row, buffer.col), (0, 0))
+        buffer.end()
+        buffer.vertical(5, 3)
+        self.assertEqual((buffer.row, buffer.col), (1, 2))
+
+    def test_wide_characters_wrap_by_display_width(self):
+        buffer = pq.EditBuffer("日本語")
+        self.assertEqual(buffer.layout(4), [(0, 0, 2), (0, 2, 3)])
+
+    def test_finish_edit_ignores_empty_and_unchanged_text(self):
+        self.assertIsNone(pq.finish_edit("  \n", ""))
+        self.assertIsNone(pq.finish_edit("same\n", "same"))
+        self.assertEqual(pq.finish_edit("new", "old"), "new")
+
+
 class DraftRecoveryTests(unittest.TestCase):
     def test_orphaned_draft_is_recovered_as_an_edit_or_new_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
