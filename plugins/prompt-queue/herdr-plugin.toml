@@ -23,12 +23,16 @@ width = "80%"
 height = "70%"
 command = ["python3", "prompt_queue.py", "ui"]
 
-# Removes inserted prompts once the agent starts working on them, and keeps the
-# sidebar count current when an agent or its session appears.
+# Removes inserted prompts once the agent starts working on them, keeps the
+# sidebar count current, and warns when a conversation ends with prompts queued.
 [[events]]
 on = "pane.agent_status_changed"
 command = ["python3", "prompt_queue.py", "hook"]
 
 [[events]]
 on = "pane.agent_detected"
+command = ["python3", "prompt_queue.py", "hook"]
+
+[[events]]
+on = "pane.closed"
 command = ["python3", "prompt_queue.py", "hook"]

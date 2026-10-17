@@ -41,6 +41,9 @@ class FakeHerdr:
     def report_count(self, pane_id, count):
         self.calls.append(("count", pane_id, count))
 
+    def notify(self, title, body):
+        self.calls.append(("notify", title, body))
+
 
 class StoreTests(unittest.TestCase):
     def setUp(self):
@@ -194,7 +197,7 @@ class QueueOperationTests(unittest.TestCase):
         self.assertEqual(self.data["deleted_queues"][-1]["key"], self.conversation.key)
 
 
-class CommandTests(unittest.TestCase):
+class CommandTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.state = pathlib.Path(self.tmp.name)
@@ -212,6 +215,8 @@ class CommandTests(unittest.TestCase):
         data = pq.Store(self.state).read()
         return [e["text"] for e in data["queues"]["session:herdr:claude:id:sess-1"]["entries"]]
 
+
+class CommandTests(CommandTestCase):
     def test_add_insert_then_working_event_consumes_entry(self):
         self.assertEqual(self.run_cli("add", "--pane", "w1:p1", "review", "the", "diff"), 0)
         self.run_cli("add", "--pane", "w1:p1", "then", "ship")
@@ -264,6 +269,63 @@ class CommandTests(unittest.TestCase):
         queue = data["queues"]["session:herdr:claude:id:sess-1"]
         self.assertEqual(queue["last_pane_id"], "w3:p2")
         self.assertEqual([e["text"] for e in queue["entries"]], ["before crash"])
+
+
+class ConversationEndedTests(CommandTestCase):
+    def event(self, name, **data):
+        return {"HERDR_PLUGIN_EVENT_JSON": json.dumps({"event": name, "data": {"pane_id": "w1:p1", **data}})}
+
+    def notifications(self):
+        return [call for call in self.fake.calls if call[0] == "notify"]
+
+    def start_with_queue(self):
+        self.run_cli("add", "--pane", "w1:p1", "still to do")
+        self.run_cli("hook", env=self.event("pane.agent_status_changed", agent_status="idle"))
+
+    def test_agent_exit_with_queued_prompts_warns_once_with_resume_command(self):
+        self.start_with_queue()
+        # Herdr keeps the session binding after exit; only the agent label goes.
+        self.fake.panes_by_id["w1:p1"] = {**claude_pane(), "agent": None}
+        self.run_cli("hook", env=self.event("pane.agent_detected"))
+        self.run_cli("hook", env=self.event("pane.agent_status_changed", agent_status="unknown"))
+        self.assertEqual(
+            self.notifications(),
+            [("notify", "claude · project ended with 1 queued prompt", "Resume with: claude --resume sess-1")],
+        )
+
+    def test_new_session_in_the_same_pane_warns_about_the_previous_one(self):
+        self.start_with_queue()
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="sess-2")
+        self.run_cli("hook", env=self.event("pane.agent_status_changed", agent_status="idle"))
+        self.assertEqual(len(self.notifications()), 1)
+
+    def test_adding_records_the_conversation_without_any_status_event(self):
+        self.run_cli("add", "--pane", "w1:p1", "queued right away")
+        self.run_cli("hook", env=self.event("pane.closed"))
+        self.assertEqual(len(self.notifications()), 1)
+
+    def test_closing_the_pane_warns(self):
+        self.start_with_queue()
+        self.run_cli("hook", env=self.event("pane.closed"))
+        self.assertEqual(len(self.notifications()), 1)
+
+    def test_no_warning_while_the_conversation_continues_or_when_queue_is_empty(self):
+        self.start_with_queue()
+        self.run_cli("hook", env=self.event("pane.agent_status_changed", agent_status="working"))
+        self.assertEqual(self.notifications(), [])
+        entry_id = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]["id"]
+        self.run_cli("remove", "--pane", "w1:p1", entry_id)
+        self.run_cli("hook", env=self.event("pane.closed"))
+        self.assertEqual(self.notifications(), [])
+
+    def test_resumed_conversation_is_not_reported_as_ended(self):
+        self.start_with_queue()
+        self.fake.panes_by_id["w1:p1"] = {**claude_pane(), "agent": None}
+        self.run_cli("hook", env=self.event("pane.agent_detected"))
+        self.fake.panes_by_id["w1:p1"] = claude_pane()
+        self.run_cli("hook", env=self.event("pane.agent_detected", agent="claude"))
+        self.run_cli("hook", env=self.event("pane.agent_status_changed", agent_status="working"))
+        self.assertEqual(len(self.notifications()), 1)
 
 
 class DraftRecoveryTests(unittest.TestCase):
