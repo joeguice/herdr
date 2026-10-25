@@ -393,9 +393,10 @@ def find_entry(queue: dict[str, Any], entry_id: str) -> tuple[int, dict[str, Any
 def add_entry(
     data: dict[str, Any], conversation: Conversation, text: str, index: int | None = None
 ) -> dict[str, Any]:
+    text = normalize_text(text)
     queue = ensure_queue(data, conversation)
     now = utc_now()
-    entry = {"id": new_id(all_entry_ids(data)), "text": normalize_text(text), "created_utc": now, "updated_utc": now}
+    entry = {"id": new_id(all_entry_ids(data)), "text": text, "created_utc": now, "updated_utc": now}
     if index is None or index >= len(queue["entries"]):
         queue["entries"].append(entry)
     else:
@@ -409,6 +410,8 @@ def edit_entry(queue: dict[str, Any], entry_id: str, text: str) -> dict[str, Any
     normalized = normalize_text(text)
     if normalized != entry["text"]:
         entry["text"] = normalized
+        # The changed text has not been pasted, even if the old text was.
+        entry.pop("pending", None)
         entry["updated_utc"] = queue["updated_utc"] = utc_now()
     return entry
 
@@ -447,9 +450,31 @@ def move_entry(queue: dict[str, Any], entry_id: str, delta: int) -> int:
     return target
 
 
+def boot_id() -> str | None:
+    """Identify a Linux/WSL boot without relying on reusable process IDs."""
+    try:
+        return pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+
+
+def input_runtime() -> dict[str, Any]:
+    """An insertion belongs to this boot and this server socket's lifetime."""
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    identity = None
+    if path:
+        with contextlib.suppress(OSError):
+            stat = pathlib.Path(path).stat()
+            identity = [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
+    return {"boot_id": boot_id(), "socket_path": path, "socket_identity": identity}
+
+
 def mark_pending(queue: dict[str, Any], entry_id: str, pane_id: str, now: float) -> None:
     _, entry = find_entry(queue, entry_id)
-    entry["pending"] = {"pane_id": pane_id, "inserted_at": now, "inserted_utc": utc_now()}
+    entry["pending"] = {
+        "pane_id": pane_id, "inserted_at": now, "inserted_utc": utc_now(),
+        "runtime": input_runtime(),
+    }
 
 
 def clear_pending(queue: dict[str, Any], entry_id: str) -> bool:
@@ -457,10 +482,14 @@ def clear_pending(queue: dict[str, Any], entry_id: str) -> bool:
     return entry.pop("pending", None) is not None
 
 
-def consume_pending(data: dict[str, Any], pane_id: str, now: float) -> list[tuple[str, dict[str, Any]]]:
+def consume_pending(
+    data: dict[str, Any], pane_id: str, now: float, *, conversation_key: str,
+) -> list[tuple[str, dict[str, Any]]]:
     """Archive entries inserted into `pane_id` before the grace window."""
     consumed: list[tuple[str, dict[str, Any]]] = []
     for key, queue in data["queues"].items():
+        if key != conversation_key:
+            continue
         for entry in list(queue["entries"]):
             pending = entry.get("pending")
             if not isinstance(pending, dict) or pending.get("pane_id") != pane_id:
@@ -619,16 +648,37 @@ def resolve(herdr: Herdr, pane_id: str, directory: pathlib.Path | None = None) -
     return conversation
 
 
-def sync_pane(store: Store, herdr: Herdr, pane: dict[str, Any]) -> Conversation:
-    """Adopt pane-keyed entries, record where the queue lives, and report its count."""
+def sync_pane(
+    store: Store, herdr: Herdr, pane: dict[str, Any], *, working: bool = False,
+) -> Conversation:
+    """Recover this exact conversation's saved prompts and refresh its count."""
     conversation = conversation_for_pane(pane)
     if pane.get("agent"):
         remember_pane_key(store.directory, conversation)
+    recover_drafts(store, conversation)
+    runtime = input_runtime()
     with store.transaction() as data:
         adopt_pane_queue(data, conversation)
         queue = queue_for(data, conversation.key)
         if queue is not None:
             touch_queue(queue, conversation)
+            for entry in queue["entries"]:
+                pending = entry.get("pending")
+                if not isinstance(pending, dict):
+                    continue
+                # A recovered PTY has lost its old unsubmitted input. Retain
+                # the queued prompt, but stop waiting for its old submit signal.
+                stale = pending.get("pane_id") != conversation.pane_id
+                if "runtime" in pending:
+                    stale = stale or pending["runtime"] != runtime
+                else:
+                    # Older markers have no proof that the original input
+                    # still exists. Prefer retaining the queued message.
+                    stale = True
+                if stale:
+                    entry.pop("pending", None)
+            if working:
+                consume_pending(data, conversation.pane_id, time.time(), conversation_key=conversation.key)
         count = entry_count(data, conversation.key)
     report_count(herdr, store.directory, conversation.pane_id, count)
     return conversation
@@ -652,6 +702,27 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def process_start(pid: int) -> str | None:
+    try:
+        # The command name in /proc/PID/stat can contain spaces and parentheses.
+        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def draft_owner_alive(meta: dict[str, Any]) -> bool:
+    owner_boot = meta.get("boot_id")
+    current_boot = boot_id()
+    if owner_boot and current_boot and owner_boot != current_boot:
+        return False
+    pid = meta.get("pid", 0)
+    if not isinstance(pid, int) or not pid_alive(pid):
+        return False
+    owner_start = meta.get("process_start")
+    current_start = process_start(pid)
+    return not owner_start or not current_start or owner_start == current_start
+
+
 def recover_drafts(store: Store, conversation: Conversation) -> int:
     """Apply drafts left behind by an editor session that never returned."""
     directory = drafts_dir(store)
@@ -663,7 +734,7 @@ def recover_drafts(store: Store, conversation: Conversation) -> int:
             meta = json.loads(meta_path.read_text())
         except (OSError, ValueError):
             continue
-        if meta.get("key") != conversation.key or pid_alive(int(meta.get("pid", 0))):
+        if not isinstance(meta, dict) or meta.get("key") != conversation.key or draft_owner_alive(meta):
             continue
         draft_path = meta_path.with_suffix(".md")
         try:
@@ -674,15 +745,29 @@ def recover_drafts(store: Store, conversation: Conversation) -> int:
             queue = queue_for(data, conversation.key)
             try:
                 entry_id = meta.get("entry_id")
+                add_as_new = False
                 if entry_id and queue is not None and any(e["id"] == entry_id for e in queue["entries"]):
-                    if normalize_text(text) != find_entry(queue, entry_id)[1]["text"]:
-                        edit_entry(queue, entry_id, text)
-                        recovered += 1
-                elif text.strip() and text.strip() != meta.get("initial", "").strip():
-                    add_entry(data, conversation, text)
+                    current = find_entry(queue, entry_id)[1]
+                    if normalize_text(text) != current["text"]:
+                        if current["text"] == meta.get("initial"):
+                            edit_entry(queue, entry_id, text)
+                            recovered += 1
+                        else:
+                            # Another writer edited this entry after the
+                            # abandoned editor opened. Keep both versions.
+                            add_as_new = True
+                else:
+                    add_as_new = bool(text.strip() and text.strip() != meta.get("initial", "").strip())
+                if add_as_new and not any(
+                    entry.get("recovered_draft") == meta_path.stem
+                    for entry in (queue["entries"] + queue["history"] if queue else [])
+                ):
+                    entry = add_entry(data, conversation, text)
+                    entry["recovered_draft"] = meta_path.stem
                     recovered += 1
             except QueueError:
-                pass
+                # Invalid/oversized drafts remain available for manual rescue.
+                continue
         for path in (draft_path, meta_path):
             with contextlib.suppress(OSError):
                 path.unlink()
@@ -705,7 +790,10 @@ class DraftFile:
         atomic_write(self.text_path, initial.encode())
         atomic_write(
             self.meta_path,
-            json.dumps({"key": conversation.key, "entry_id": entry_id, "pid": os.getpid(), "initial": initial}).encode(),
+            json.dumps({
+                "key": conversation.key, "entry_id": entry_id, "pid": os.getpid(), "initial": initial,
+                "boot_id": boot_id(), "process_start": process_start(os.getpid()),
+            }).encode(),
         )
 
     def save(self, text: str, now: float, force: bool = False) -> None:
@@ -1393,13 +1481,10 @@ def cmd_hook(args: argparse.Namespace) -> int:
     if not isinstance(pane_id, str):
         return 0
     store = Store(args.state_dir)
-    if not store.path.exists():
+    if not store.path.exists() and not drafts_dir(store).is_dir():
         return 0
     event_name = str(event.get("event") or os.environ.get("HERDR_PLUGIN_EVENT") or "")
     herdr = Herdr()
-    if data_section.get("agent_status") == "working":
-        with store.transaction() as data:
-            consume_pending(data, pane_id, time.time())
     if event_name == "pane.closed":
         warn_if_ended(store, herdr, pane_id, None)
         return 0
@@ -1410,7 +1495,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
         agent_left = event_name == "pane.agent_detected" and not pane.get("agent")
         current = conversation_for_pane(pane)
         warn_if_ended(store, herdr, pane_id, None if agent_left else current.key)
-        sync_pane(store, herdr, pane)
+        sync_pane(store, herdr, pane, working=data_section.get("agent_status") == "working")
     except (HerdrError, QueueError):
         pass
     return 0
@@ -1421,7 +1506,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
     for name in (COUNTS_CACHE, PANE_KEYS_CACHE):
         with contextlib.suppress(FileNotFoundError):
             (store.directory / name).unlink()
-    if not store.path.exists():
+    if not store.path.exists() and not drafts_dir(store).is_dir():
         return 0
     herdr = Herdr()
     for pane in herdr.panes():
