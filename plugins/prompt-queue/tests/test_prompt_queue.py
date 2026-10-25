@@ -165,9 +165,9 @@ class QueueOperationTests(unittest.TestCase):
         pq.add_entry(self.data, self.conversation, "waiting")
         now = time.time()
         pq.mark_pending(self.queue(), inserted["id"], "w1:p1", now)
-        self.assertEqual(pq.consume_pending(self.data, "w1:p1", now + 0.1), [])
-        self.assertEqual(pq.consume_pending(self.data, "w2:p1", now + 5), [])
-        consumed = pq.consume_pending(self.data, "w1:p1", now + 5)
+        self.assertEqual(pq.consume_pending(self.data, "w1:p1", now + 0.1, conversation_key=self.conversation.key), [])
+        self.assertEqual(pq.consume_pending(self.data, "w2:p1", now + 5, conversation_key=self.conversation.key), [])
+        consumed = pq.consume_pending(self.data, "w1:p1", now + 5, conversation_key=self.conversation.key)
         self.assertEqual([entry["id"] for _, entry in consumed], [inserted["id"]])
         self.assertEqual(self.texts(), ["waiting"])
         self.assertEqual(self.queue()["history"][-1]["reason"], "submitted")
@@ -177,7 +177,7 @@ class QueueOperationTests(unittest.TestCase):
         entry = pq.add_entry(self.data, self.conversation, "x")
         pq.mark_pending(self.queue(), entry["id"], "w1:p1", 0)
         self.assertTrue(pq.clear_pending(self.queue(), entry["id"]))
-        self.assertEqual(pq.consume_pending(self.data, "w1:p1", 100), [])
+        self.assertEqual(pq.consume_pending(self.data, "w1:p1", 100, conversation_key=self.conversation.key), [])
 
     def test_pane_queue_is_adopted_when_session_appears(self):
         bare = pq.conversation_for_pane(claude_pane(session=None))
@@ -269,6 +269,133 @@ class CommandTests(CommandTestCase):
         queue = data["queues"]["session:herdr:claude:id:sess-1"]
         self.assertEqual(queue["last_pane_id"], "w3:p2")
         self.assertEqual([e["text"] for e in queue["entries"]], ["before crash"])
+
+    def test_unsent_insert_survives_restart_and_first_working_event(self):
+        with mock.patch.object(pq, "input_runtime", return_value={"boot": "before"}):
+            self.run_cli("add", "--pane", "w1:p1", "not submitted")
+            entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+            self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        with mock.patch.object(pq, "input_runtime", return_value={"boot": "after"}):
+            self.run_cli("startup")
+            event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+            self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        queue = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]
+        self.assertEqual([e["text"] for e in queue["entries"]], ["not submitted"])
+        self.assertNotIn("pending", queue["entries"][0])
+        self.assertEqual(queue["history"], [])
+
+    def test_late_recovery_without_startup_also_preserves_unsent_insert(self):
+        with mock.patch.object(pq, "input_runtime", return_value={"boot": "before"}):
+            self.run_cli("add", "--pane", "w1:p1", "keep this")
+            entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+            self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        with mock.patch.object(pq, "input_runtime", return_value={"boot": "after"}):
+            event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+            self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        self.assertEqual(self.queue_texts(), ["keep this"])
+
+    def test_working_event_does_not_consume_another_conversations_insert(self):
+        self.run_cli("add", "--pane", "w1:p1", "belongs to old conversation")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="replacement")
+        event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+        with mock.patch.object(pq.time, "time", return_value=time.time() + 10):
+            self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        self.assertEqual(self.queue_texts(), ["belongs to old conversation"])
+
+    def test_recovered_session_clears_old_pane_insertion_marker(self):
+        self.run_cli("add", "--pane", "w1:p1", "before crash")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        self.fake.panes_by_id = {"w3:p2": claude_pane("w3:p2")}
+        self.run_cli("startup")
+        queue = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]
+        self.assertNotIn("pending", queue["entries"][0])
+        self.assertIn(("count", "w3:p2", 1), self.fake.calls)
+
+    def test_live_reconciliation_keeps_current_runtime_insert_tracking(self):
+        self.run_cli("add", "--pane", "w1:p1", "live input")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        self.run_cli("startup")
+        queue = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]
+        self.assertIn("pending", queue["entries"][0])
+
+    def test_startup_recovers_draft_only_store_and_reports_count_without_sending(self):
+        drafts = self.state / "drafts"
+        drafts.mkdir()
+        (drafts / "first.md").write_text("unfinished queued message")
+        (drafts / "first.json").write_text(json.dumps({
+            "key": "session:herdr:claude:id:sess-1", "pid": os.getpid(),
+            "boot_id": "previous-boot", "entry_id": None, "initial": "",
+        }))
+        with mock.patch.object(pq, "boot_id", return_value="current-boot"):
+            self.assertEqual(self.run_cli("startup"), 0)
+        self.assertEqual(self.queue_texts(), ["unfinished queued message"])
+        self.assertEqual(self.fake.calls, [("count", "w1:p1", 1)])
+        self.run_cli("startup")
+        self.assertEqual(self.queue_texts(), ["unfinished queued message"])
+
+    def test_late_recovered_session_gets_draft_and_count_on_detection(self):
+        drafts = self.state / "drafts"
+        drafts.mkdir()
+        (drafts / "later.md").write_text("saved before recovery")
+        (drafts / "later.json").write_text(json.dumps({
+            "key": "session:herdr:claude:id:sess-1", "pid": 2**30,
+            "entry_id": None, "initial": "",
+        }))
+        self.fake.panes_by_id = {"w1:p1": claude_pane(session=None)}
+        self.run_cli("startup")
+        self.assertFalse((self.state / "queues.json").exists())
+        self.fake.panes_by_id["w1:p1"] = claude_pane()
+        event = {"event": "pane.agent_detected", "data": {"pane_id": "w1:p1", "agent": "claude"}}
+        self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        self.assertEqual(self.queue_texts(), ["saved before recovery"])
+        self.assertIn(("count", "w1:p1", 1), self.fake.calls)
+
+    def test_different_session_in_same_directory_does_not_adopt_old_queue_or_draft(self):
+        self.run_cli("add", "--pane", "w1:p1", "old queued prompt")
+        drafts = self.state / "drafts"
+        drafts.mkdir()
+        (drafts / "old.md").write_text("old draft")
+        (drafts / "old.json").write_text(json.dumps({
+            "key": "session:herdr:claude:id:sess-1", "pid": 2**30,
+            "entry_id": None, "initial": "",
+        }))
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="different")
+        self.fake.calls.clear()
+        self.run_cli("startup")
+        self.assertEqual(self.queue_texts(), ["old queued prompt"])
+        self.assertTrue((drafts / "old.json").exists())
+        self.assertEqual(self.fake.calls, [])
+
+    def test_working_event_retains_recovered_edit_of_previously_inserted_prompt(self):
+        self.run_cli("add", "--pane", "w1:p1", "old pasted text")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+        drafts = self.state / "drafts"
+        drafts.mkdir()
+        (drafts / "edit.md").write_text("new unsent edited text")
+        (drafts / "edit.json").write_text(json.dumps({
+            "key": "session:herdr:claude:id:sess-1", "pid": 2**30,
+            "entry_id": entry["id"], "initial": "old pasted text",
+        }))
+        event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+        with mock.patch.object(pq.time, "time", return_value=time.time() + 10):
+            self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        self.assertEqual(self.queue_texts(), ["new unsent edited text"])
+        queue = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]
+        self.assertEqual(queue["history"], [])
+
+    def test_legacy_unscoped_pending_marker_is_retained_as_unsent(self):
+        self.run_cli("add", "--pane", "w1:p1", "legacy unsent prompt")
+        with pq.Store(self.state).transaction() as data:
+            entry = data["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+            entry["pending"] = {"pane_id": "w1:p1", "inserted_at": 0}
+        event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+        self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+        self.assertEqual(self.queue_texts(), ["legacy unsent prompt"])
 
 
 class ConversationEndedTests(CommandTestCase):
@@ -385,6 +512,69 @@ class EditBufferTests(unittest.TestCase):
 
 
 class DraftRecoveryTests(unittest.TestCase):
+    def test_recovered_edit_preserves_a_newer_queue_edit_and_both_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            conversation = pq.conversation_for_pane(claude_pane())
+            with store.transaction() as data:
+                entry = pq.add_entry(data, conversation, "initial text")
+            drafts = pq.drafts_dir(store)
+            drafts.mkdir()
+            (drafts / "conflict.md").write_text("abandoned draft version")
+            (drafts / "conflict.json").write_text(json.dumps({
+                "key": conversation.key, "entry_id": entry["id"],
+                "pid": 2**30, "initial": "initial text",
+            }))
+            with store.transaction() as data:
+                pq.edit_entry(data["queues"][conversation.key], entry["id"], "newer intentional edit")
+            self.assertEqual(pq.recover_drafts(store, conversation), 1)
+            entries = store.read()["queues"][conversation.key]["entries"]
+            self.assertEqual([e["text"] for e in entries], ["newer intentional edit", "abandoned draft version"])
+
+    def test_oversized_draft_is_preserved_for_manual_rescue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            conversation = pq.conversation_for_pane(claude_pane())
+            drafts = pq.drafts_dir(store)
+            drafts.mkdir()
+            (drafts / "large.md").write_text("x" * (pq.MAX_ENTRY_BYTES + 1))
+            (drafts / "large.json").write_text(json.dumps({
+                "key": conversation.key, "entry_id": None, "pid": 2**30, "initial": "",
+            }))
+            self.assertEqual(pq.recover_drafts(store, conversation), 0)
+            self.assertTrue((drafts / "large.md").exists())
+            self.assertTrue((drafts / "large.json").exists())
+            self.assertFalse(store.path.exists())
+
+    def test_active_editor_is_not_recovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            conversation = pq.conversation_for_pane(claude_pane())
+            draft = pq.DraftFile(store, conversation, "", None)
+            draft.save("still typing", time.monotonic(), force=True)
+            self.assertEqual(pq.recover_drafts(store, conversation), 0)
+            self.assertFalse(store.path.exists())
+            self.assertTrue(draft.meta_path.exists())
+
+    def test_reused_pid_is_not_treated_as_live_editor(self):
+        meta = {"pid": os.getpid(), "boot_id": "same-boot", "process_start": "old-start"}
+        with mock.patch.object(pq, "boot_id", return_value="same-boot"), mock.patch.object(pq, "process_start", return_value="new-start"):
+            self.assertFalse(pq.draft_owner_alive(meta))
+
+    def test_recovering_same_draft_again_does_not_duplicate_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            conversation = pq.conversation_for_pane(claude_pane())
+            drafts = pq.drafts_dir(store)
+            drafts.mkdir()
+            text = "saved queued prompt"
+            meta = json.dumps({"key": conversation.key, "pid": 2**30, "initial": "", "entry_id": None})
+            for attempt in range(2):
+                (drafts / "same.md").write_text(text)
+                (drafts / "same.json").write_text(meta)
+                self.assertEqual(pq.recover_drafts(store, conversation), 1 if attempt == 0 else 0)
+            self.assertEqual(len(store.read()["queues"][conversation.key]["entries"]), 1)
+
     def test_orphaned_draft_is_recovered_as_an_edit_or_new_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = pq.Store(pathlib.Path(tmp))

@@ -111,6 +111,19 @@ into the session's queue.
 If a conversation comes back under a new session ID, its old queue stays
 intact. Use `o` to move it into the current conversation.
 
+Recovery runs automatically at server startup and when a recovered agent is
+detected or changes status. Saved prompts and abandoned editor drafts return
+to the original native conversation, including when it resumes in another
+pane, and its sidebar count is rebuilt. A different conversation in the same
+pane or directory does not inherit the queue.
+
+An inserted prompt that was never submitted stays queued after recovery.
+Its old insertion marker is cleared when the boot, server socket, or pane
+changes, so the recovered agent starting work cannot mistake it for a new
+submission. Recovery does not paste or submit messages. A live reconciliation
+with the same input runtime preserves insertion tracking; a server handoff
+that replaces the socket conservatively clears it and retains the prompt.
+
 ## Crash durability
 
 State lives in `~/.local/state/herdr/plugins/joeguice.prompt-queue/`:
@@ -122,7 +135,11 @@ State lives in `~/.local/state/herdr/plugins/joeguice.prompt-queue/`:
   is moved aside as `queues.json.corrupt-*` and the backup is restored.
 - `drafts/`: prompts being added or edited, saved about once a second while
   you type. If the popup dies mid-edit, the draft is applied the next time you
-  open that conversation's queue.
+  open that conversation's queue or that conversation is automatically
+  reconciled after recovery. Linux/WSL drafts record boot and process identity
+  so a reused PID cannot keep a pre-restart draft hidden. If the queued entry
+  has a newer edit, recovery keeps it and adds the abandoned draft separately.
+  Invalid or oversized drafts stay on disk for manual recovery.
 - `reported-counts.json`: a disposable cache of sidebar counts. The startup
   hook rebuilds it.
 

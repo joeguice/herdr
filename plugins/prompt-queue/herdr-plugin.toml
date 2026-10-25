@@ -1,11 +1,11 @@
 id = "joeguice.prompt-queue"
 name = "Prompt queue"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.3"
 description = "Queue prompts per agent conversation and insert them into the prompt later"
 platforms = ["linux", "macos"]
 
-# Restore sidebar counts after a server restart; pane tokens are not persisted.
+# Recover matching conversations' prompts/drafts and rebuild sidebar counts.
 [[startup]]
 command = ["python3", "prompt_queue.py", "startup"]
 
