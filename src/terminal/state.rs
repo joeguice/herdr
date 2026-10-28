@@ -1808,6 +1808,21 @@ impl TerminalState {
         })
     }
 
+    /// The compare-and-act API has already checked the exact current identity.
+    /// Advance this source's existing sequence so that clearing a sequenced
+    /// binding works without weakening ordering for subsequent hook reports.
+    pub(crate) fn release_agent_from_checked_api(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+    ) -> Option<TerminalStateMutation> {
+        let seq = match self.hook_report_sequences.get(source) {
+            Some(last) => Some(last.checked_add(1)?),
+            None => None,
+        };
+        self.release_agent_with_mutation(source, agent_label, seq)
+    }
+
     pub fn release_agent_with_mutation(
         &mut self,
         source: &str,

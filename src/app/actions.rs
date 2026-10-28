@@ -1672,6 +1672,21 @@ impl AppState {
         }
     }
 
+    /// Explicit checked API clears may retire an official native binding without
+    /// pretending that its process exited. Hook releases keep their old policy.
+    pub(crate) fn clear_agent_session_for_api(
+        &mut self,
+        pane_id: PaneId,
+        source: &str,
+        agent: &str,
+    ) -> Vec<PaneStateUpdate> {
+        self.update_terminal_state(pane_id, |terminal| {
+            terminal.release_agent_from_checked_api(source, agent)
+        })
+        .into_iter()
+        .collect()
+    }
+
     fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,

@@ -533,6 +533,42 @@ pub struct PaneInfo {
     pub revision: u64,
 }
 
+/// Compare-and-act identity for native conversation operations. These fields
+/// belong only to additive JSON methods, not to a frozen client codec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSessionExpectation {
+    pub expected_terminal_id: String,
+    pub expected_agent_session: Option<AgentSessionInfo>,
+    pub expected_terminal_title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneClearAgentSessionParams {
+    pub pane_id: String,
+    #[serde(flatten)]
+    pub expected: PaneSessionExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendInputCheckedParams {
+    pub pane_id: String,
+    pub text: String,
+    #[serde(flatten)]
+    pub expected: PaneSessionExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportAgentSessionCheckedParams {
+    pub pane_id: String,
+    pub source: String,
+    pub agent: String,
+    pub agent_session_id: String,
+    pub seq: Option<u64>,
+    pub session_start_source: Option<String>,
+    #[serde(flatten)]
+    pub expected: PaneSessionExpectation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneScrollInfo {
     pub offset_from_bottom: u64,

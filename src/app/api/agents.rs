@@ -84,8 +84,17 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let (params, expected) = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => (params, None),
+            crate::api::schema::Method::AgentPromptChecked(params) => (
+                AgentPromptParams {
+                    target: params.target,
+                    text: params.text,
+                    wait: None,
+                },
+                Some(params.expected),
+            ),
+            _ => return false,
         };
         let validated = match self.validate_agent_prompt(request.id, &params) {
             Ok(validated) => validated,
@@ -125,6 +134,18 @@ impl App {
             ));
             return true;
         }
+        // This check runs at actual deferred dispatch, immediately before input
+        // is queued. No selection/event can run between this guard and enqueue.
+        if let Some(expected) = expected {
+            if let Err(error) = self.validate_input_session_expectation(
+                &validated.id,
+                &validated.agent.pane_id,
+                &expected,
+            ) {
+                let _ = respond_to.send(error);
+                return true;
+            }
+        }
         match self.submit_agent_prompt(validated, &params) {
             Ok(submission) => {
                 let _ = handoff_tx.send(submission);
@@ -134,6 +155,23 @@ impl App {
             }
         }
         true
+    }
+
+    pub(super) fn validate_checked_agent_input(
+        &self,
+        id: &str,
+        target: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        self.validate_agent_prompt(
+            id.to_string(),
+            &AgentPromptParams {
+                target: target.to_string(),
+                text: text.to_string(),
+                wait: None,
+            },
+        )
+        .map(|_| ())
     }
 
     /// Runs every check that can reject a prompt without touching the pane.
@@ -498,6 +536,69 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    #[tokio::test]
+    async fn checked_prompt_validates_native_recipient_at_deferred_dispatch() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_terminal_title(Some("session-a | repo".into()));
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("session-a").unwrap(),
+        });
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let pane = app.pane_info(0, pane_id).unwrap();
+        let expected = crate::api::schema::PaneSessionExpectation {
+            expected_terminal_id: pane.terminal_id,
+            expected_agent_session: pane.agent_session,
+            expected_terminal_title: pane.terminal_title,
+        };
+        let target = pane.pane_id;
+        for mismatch in [true, false] {
+            let mut guard = expected.clone();
+            if mismatch {
+                guard.expected_agent_session.as_mut().unwrap().value = "replacement-session".into();
+            }
+            let (tx, result) = std::sync::mpsc::channel();
+            assert!(app.handle_deferred_agent_api_request(
+                crate::api::schema::Request {
+                    id: "checked".into(),
+                    method: crate::api::schema::Method::AgentPromptChecked(
+                        crate::api::schema::AgentPromptCheckedParams {
+                            target: target.clone(),
+                            text: "safe message".into(),
+                            expected: guard,
+                        }
+                    ),
+                },
+                tx
+            ));
+            let response = result.recv_timeout(Duration::from_secs(1)).unwrap();
+            if mismatch {
+                let response: crate::api::schema::ErrorResponse =
+                    serde_json::from_str(&response).unwrap();
+                assert_eq!(response.error.code, "agent_session_changed");
+                assert!(rx.try_recv().is_err());
+            } else {
+                let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+                assert!(matches!(
+                    response.result,
+                    ResponseResult::AgentPrompted { .. }
+                ));
+                assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"safe message"));
+                assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+                assert!(rx.try_recv().is_err());
+            }
+        }
     }
 
     #[cfg(windows)]
