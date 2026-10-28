@@ -1228,6 +1228,42 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptCheckedParams": {
+          "description": "Compare-and-act identity for native conversation operations. These fields\nbelong only to additive JSON methods, not to a frozen client codec.",
+          "properties": {
+            "expected_agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1337,6 +1373,36 @@
             "keys"
           ],
           "type": "object"
+        },
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
         },
         "AgentStartParams": {
           "properties": {
@@ -2462,6 +2528,38 @@
           ],
           "type": "object"
         },
+        "PaneClearAgentSessionParams": {
+          "description": "Compare-and-act identity for native conversation operations. These fields\nbelong only to additive JSON methods, not to a frozen client codec.",
+          "properties": {
+            "expected_agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "expected_terminal_id"
+          ],
+          "type": "object"
+        },
         "PaneCopyMotion": {
           "enum": [
             "line_end",
@@ -2942,6 +3040,64 @@
           ],
           "type": "object"
         },
+        "PaneReportAgentSessionCheckedParams": {
+          "description": "Compare-and-act identity for native conversation operations. These fields\nbelong only to additive JSON methods, not to a frozen client codec.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_session_id": {
+              "type": "string"
+            },
+            "expected_agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session_start_source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "source",
+            "agent",
+            "agent_session_id",
+            "expected_terminal_id"
+          ],
+          "type": "object"
+        },
         "PaneReportAgentSessionParams": {
           "properties": {
             "agent": {
@@ -3156,6 +3312,42 @@
             "pane_id",
             "anchor",
             "cursor"
+          ],
+          "type": "object"
+        },
+        "PaneSendInputCheckedParams": {
+          "description": "Compare-and-act identity for native conversation operations. These fields\nbelong only to additive JSON methods, not to a frozen client codec.",
+          "properties": {
+            "expected_agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text",
+            "expected_terminal_id"
           ],
           "type": "object"
         },
@@ -6305,6 +6497,70 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.clear_agent_session",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneClearAgentSessionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.send_input_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendInputCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.report_agent_session_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentSessionCheckedParams"
             }
           },
           "required": [

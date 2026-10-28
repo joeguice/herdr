@@ -145,6 +145,12 @@ operations::define_operations! {
     PluginPaneOpen(PluginPaneOpenParams) => "plugin.pane.open", true, false;
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
+    // Additive JSON methods. Existing operations and named client codecs retain
+    // their existing order, fields, and semantics.
+    PaneClearAgentSession(PaneClearAgentSessionParams) => "pane.clear_agent_session", true, false;
+    PaneSendInputChecked(PaneSendInputCheckedParams) => "pane.send_input_checked", false, false;
+    AgentPromptChecked(AgentPromptCheckedParams) => "agent.prompt_checked", true, false;
+    PaneReportAgentSessionChecked(PaneReportAgentSessionCheckedParams) => "pane.report_agent_session_checked", true, false;
 }
 
 #[cfg(test)]

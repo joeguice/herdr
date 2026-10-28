@@ -1121,7 +1121,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
-            Method::AgentPrompt(_) => {
+            Method::AgentPrompt(_) | Method::AgentPromptChecked(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
@@ -1192,6 +1192,9 @@ impl App {
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);
             }
+            Method::PaneReportAgentSessionChecked(params) => {
+                return self.handle_pane_report_agent_session_checked(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }
@@ -1200,6 +1203,12 @@ impl App {
             }
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
+            }
+            Method::PaneClearAgentSession(params) => {
+                return self.handle_pane_clear_agent_session(request.id, params);
+            }
+            Method::PaneSendInputChecked(params) => {
+                return self.handle_pane_send_input_checked(request.id, params);
             }
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {

@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -207,8 +208,11 @@ def encode_data(data: dict[str, Any]) -> bytes:
 
 
 class Herdr:
-    def __init__(self, socket_path: str | None = None):
+    def __init__(self, socket_path: str | None = None, *, proc_root=None, codex_locks=None):
         self.socket_path = socket_path or os.environ.get("HERDR_SOCKET_PATH")
+        self.proc_root = pathlib.Path(proc_root) if proc_root is not None else pathlib.Path("/proc")
+        self.codex_locks = (pathlib.Path(codex_locks) if codex_locks is not None
+                            else pathlib.Path.home() / ".codex/thread-writer-locks").resolve()
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.socket_path:
@@ -247,16 +251,69 @@ class Herdr:
         panes = self.request("pane.list", {}).get("panes")
         return [pane for pane in panes or [] if isinstance(pane, dict)]
 
-    def paste(self, pane_id: str, text: str) -> None:
-        # pane.send_input wraps text in bracketed paste when the pane enabled
-        # it; an empty key list keeps the text unsubmitted.
-        self.request("pane.send_input", {"pane_id": pane_id, "text": text, "keys": []})
+    def selected_codex_session(self, pane: dict[str, Any]) -> str | None:
+        """Resolve the title's selected UUID only from this pane's live process."""
+        prefix = codex_title_prefix(pane)
+        if not prefix:
+            return None
+        try:
+            info = self.request("pane.process_info", {"pane_id": pane["pane_id"]})["process_info"]
+            if not isinstance(info, dict) or info.get("pane_id") != pane["pane_id"]:
+                return None
+            if not isinstance(info.get("foreground_processes"), list):
+                return None
+            processes = [p for p in info["foreground_processes"]
+                         if isinstance(p, dict) and p.get("name") == "codex"]
+            if len(processes) != 1:
+                return None
+            process = processes[0]
+            pid = process["pid"]
+            if type(pid) is not int or pid <= 0:
+                return None
+            root = self.proc_root / str(pid)
 
-    def submit(self, pane_id: str, text: str, is_agent: bool) -> None:
-        if is_agent:
-            self.request("agent.prompt", {"target": pane_id, "text": text})
-        else:
-            self.request("pane.send_input", {"pane_id": pane_id, "text": text, "keys": ["Enter"]})
+            def identity():
+                return (root.stat().st_uid, (root / "exe").resolve().name,
+                        str((root / "cwd").resolve(strict=True)),
+                        (root / "stat").read_text().rsplit(") ", 1)[1].split()[19])
+
+            before = identity()
+            if (before[0] != os.getuid() or before[1] != "codex" or before[2] != process.get("cwd")
+                    or before[2] not in (pane.get("cwd"), pane.get("foreground_cwd"))):
+                return None
+            sessions = set()
+            for fd in (root / "fd").iterdir():
+                try:
+                    target = pathlib.Path(os.readlink(fd))
+                except FileNotFoundError:
+                    continue
+                if target.parent == self.codex_locks and re.fullmatch(
+                        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.lock", target.name):
+                    sessions.add(target.stem)
+            selected = [session for session in sessions if session.startswith(prefix)]
+            return selected[0] if len(selected) == 1 and identity() == before else None
+        except (OSError, ValueError, KeyError, TypeError, IndexError, HerdrError):
+            return None
+
+    @staticmethod
+    def checked_context(expected: Conversation) -> dict[str, Any]:
+        if not expected.terminal_id or not expected.session:
+            raise QueueError("Live terminal and native conversation identity are required for delivery")
+        return {"expected_terminal_id": expected.terminal_id,
+                "expected_agent_session": copy.deepcopy(expected.session),
+                "expected_terminal_title": expected.terminal_title}
+
+    def paste(self, pane_id: str, text: str, *, expected: Conversation) -> None:
+        # Checked input keeps bracketed-paste behavior without submission. The
+        # server validates terminal, binding and raw title in the same dispatch.
+        self.request("pane.send_input_checked",
+                     {"pane_id": pane_id, "text": text, **self.checked_context(expected)})
+
+    def submit(self, pane_id: str, text: str, is_agent: bool, *, expected: Conversation) -> None:
+        if not is_agent:
+            raise QueueError("An active native agent conversation is required for delivery")
+        self.request("agent.prompt_checked",
+                     {"target": pane_id, "text": text, **self.checked_context(expected)})
 
     def notify(self, title: str, body: str) -> None:
         self.request("notification.show", {"title": title, "body": body, "sound": "request"})
@@ -281,6 +338,8 @@ class Conversation:
     agent: str | None
     cwd: str | None
     session: dict[str, Any] | None
+    terminal_id: str | None = None
+    terminal_title: str | None = None
 
     @property
     def pane_key(self) -> str:
@@ -291,30 +350,62 @@ def pane_key(pane_id: str) -> str:
     return f"pane:{pane_id}"
 
 
-def conversation_for_pane(pane: dict[str, Any]) -> Conversation:
+def codex_title_prefix(pane: dict[str, Any]) -> str:
+    # Managed title order: optional spinner, session-id, project. Codex 0.165.0
+    # can shorten the UUID's final group to five characters followed by "...".
+    title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
+    if not isinstance(title, str):
+        return ""
+    match = re.match(
+        r"^(?:[\u2800-\u28ff](?: \| |\s+))?"
+        r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{5,12})(\.\.\.)?(?: \| |$)",
+        title.strip(),
+    )
+    return match[1] if match and ((len(match[1]) == 36 and not match[2])
+                                 or (len(match[1]) == 29 and match[2])) else ""
+
+
+def codex_binding_matches_title(pane: dict[str, Any]) -> bool:
+    session = pane.get("agent_session")
+    value = session.get("value") if isinstance(session, dict) else None
+    prefix = codex_title_prefix(pane)
+    return bool(prefix and isinstance(value, str) and value.startswith(prefix))
+
+
+def conversation_for_pane(pane: dict[str, Any], *, codex_session: str | None = None) -> Conversation:
     pane_id = str(pane.get("pane_id") or "")
     if not pane_id:
         raise QueueError("pane has no pane_id")
     agent = pane.get("agent") if isinstance(pane.get("agent"), str) else None
     cwd = pane.get("foreground_cwd") or pane.get("cwd")
     session = pane.get("agent_session")
-    if isinstance(session, dict) and isinstance(session.get("value"), str) and session["value"]:
-        key = "session:{}:{}:{}".format(
-            session.get("source", ""), session.get("kind", ""), session["value"]
-        )
+    if (isinstance(session, dict)
+            and all(isinstance(session.get(field), str) and session[field]
+                    for field in ("source", "agent", "kind", "value"))
+            and (agent is None or agent == session["agent"])):
         session_agent = session.get("agent") if isinstance(session.get("agent"), str) else None
         agent = agent or session_agent
+        if agent == "codex" and (not codex_binding_matches_title(pane) or codex_session != session["value"]):
+            session = None
     else:
         session = None
-        key = pane_key(pane_id)
+    key = ("session:{}:{}:{}".format(session.get("source", ""), session.get("kind", ""), session["value"])
+           if session else pane_key(pane_id))
     label = agent or "terminal"
     if isinstance(cwd, str) and cwd:
         label = f"{label} · {pathlib.PurePath(cwd).name or cwd}"
-    return Conversation(key, label, pane_id, agent, cwd if isinstance(cwd, str) else None, session)
+    return Conversation(key, label, pane_id, agent, cwd if isinstance(cwd, str) else None, session,
+                        pane.get("terminal_id") if isinstance(pane.get("terminal_id"), str) else None,
+                        pane.get("terminal_title") if isinstance(pane.get("terminal_title"), str) else None)
 
 
 def fallback_conversation(pane_id: str) -> Conversation:
     return Conversation(pane_key(pane_id), f"pane {pane_id}", pane_id, None, None, None)
+
+
+def resolved_conversation(herdr: Herdr, pane: dict[str, Any]) -> Conversation:
+    proof = herdr.selected_codex_session(pane) if pane.get("agent") == "codex" else None
+    return conversation_for_pane(pane, codex_session=proof)
 
 
 def new_id(existing: set[str]) -> str:
@@ -500,19 +591,6 @@ def consume_pending(
     return consumed
 
 
-def adopt_pane_queue(data: dict[str, Any], conversation: Conversation) -> int:
-    """Move a pane-keyed queue into the conversation that now owns the pane."""
-    if conversation.key == conversation.pane_key:
-        return 0
-    orphan = data["queues"].get(conversation.pane_key)
-    if orphan is None:
-        return 0
-    if not orphan["entries"] and not orphan["history"]:
-        del data["queues"][conversation.pane_key]
-        return 0
-    return merge_queue(data, conversation.pane_key, conversation)
-
-
 def merge_queue(data: dict[str, Any], source_key: str, conversation: Conversation) -> int:
     if source_key == conversation.key:
         return 0
@@ -642,23 +720,66 @@ def resolve(herdr: Herdr, pane_id: str, directory: pathlib.Path | None = None) -
         pane = herdr.pane(pane_id)
     except HerdrError:
         return fallback_conversation(pane_id)
-    conversation = conversation_for_pane(pane)
+    conversation = resolved_conversation(herdr, pane)
     if directory is not None and pane.get("agent"):
         remember_pane_key(directory, conversation)
     return conversation
+
+
+def delivery_conversation(herdr: Herdr, expected: Conversation) -> Conversation:
+    """Verify native ownership immediately before a user-requested delivery.
+
+    A pane can outlive its conversation. Neither a cached popup identity nor a
+    pane-keyed queue proves that the current recipient owns the queued prompt.
+    """
+    def identity(conversation: Conversation) -> tuple[str, ...] | None:
+        session = conversation.session
+        if not isinstance(session, dict):
+            return None
+        fields = tuple(session.get(key) for key in ("source", "agent", "kind", "value"))
+        if (any(not isinstance(value, str) or not value for value in fields)
+                or conversation.agent != session.get("agent")):
+            return None
+        return fields
+
+    expected_identity = identity(expected)
+    if expected_identity is None:
+        raise QueueError("Conversation identity is unavailable; keep this queue and reopen after binding")
+    pane = herdr.pane(expected.pane_id)
+    current = resolved_conversation(herdr, pane)
+    if (pane.get("agent") != expected.agent or current.pane_id != expected.pane_id
+            or identity(current) != expected_identity):
+        raise QueueError("Conversation changed or is unavailable; reopen the queue before delivery")
+    if not current.terminal_id:
+        raise QueueError("Live terminal identity is unavailable; queued prompt retained")
+    return current
 
 
 def sync_pane(
     store: Store, herdr: Herdr, pane: dict[str, Any], *, working: bool = False,
 ) -> Conversation:
     """Recover this exact conversation's saved prompts and refresh its count."""
-    conversation = conversation_for_pane(pane)
+    conversation = resolved_conversation(herdr, pane)
     if pane.get("agent"):
         remember_pane_key(store.directory, conversation)
+    recover_unassigned_drafts(store)
     recover_drafts(store, conversation)
     runtime = input_runtime()
+    verified = conversation.session is not None and pane.get("agent") == conversation.agent
     with store.transaction() as data:
-        adopt_pane_queue(data, conversation)
+        binding = pane.get("agent_session")
+        if (conversation.agent == "codex" and isinstance(binding, dict)
+                and conversation.session is None):
+            # A different idle thread can start working while the old native
+            # binding remains. Its input no longer proves submission of the
+            # old queued prompt, even within the same server/socket runtime.
+            old_key = "session:{}:{}:{}".format(binding.get("source", ""), binding.get("kind", ""),
+                                                binding.get("value", ""))
+            old_queue = queue_for(data, old_key)
+            for entry in old_queue["entries"] if old_queue else []:
+                pending = entry.get("pending")
+                if isinstance(pending, dict) and pending.get("pane_id") == conversation.pane_id:
+                    entry.pop("pending", None)
         queue = queue_for(data, conversation.key)
         if queue is not None:
             touch_queue(queue, conversation)
@@ -668,7 +789,7 @@ def sync_pane(
                     continue
                 # A recovered PTY has lost its old unsubmitted input. Retain
                 # the queued prompt, but stop waiting for its old submit signal.
-                stale = pending.get("pane_id") != conversation.pane_id
+                stale = not verified or pending.get("pane_id") != conversation.pane_id
                 if "runtime" in pending:
                     stale = stale or pending["runtime"] != runtime
                 else:
@@ -677,7 +798,7 @@ def sync_pane(
                     stale = True
                 if stale:
                     entry.pop("pending", None)
-            if working:
+            if working and verified:
                 consume_pending(data, conversation.pane_id, time.time(), conversation_key=conversation.key)
         count = entry_count(data, conversation.key)
     report_count(herdr, store.directory, conversation.pane_id, count)
@@ -774,6 +895,20 @@ def recover_drafts(store: Store, conversation: Conversation) -> int:
     return recovered
 
 
+def recover_unassigned_drafts(store: Store) -> int:
+    """Expose abandoned drafts under their original unbound pane queue only."""
+    keys = set()
+    for meta_path in drafts_dir(store).glob("*.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            continue
+        key = meta.get("key") if isinstance(meta, dict) else None
+        if isinstance(key, str) and key.startswith("pane:") and key[5:]:
+            keys.add(key)
+    return sum(recover_drafts(store, fallback_conversation(key[5:])) for key in sorted(keys))
+
+
 class DraftFile:
     """On-disk copy of an open edit, applied by recover_drafts after a crash."""
 
@@ -787,6 +922,7 @@ class DraftFile:
         self.meta_path = directory / f"{stem}.json"
         self.saved = initial
         self.saved_at = 0.0
+        self.unassigned = conversation.session is None
         atomic_write(self.text_path, initial.encode())
         atomic_write(
             self.meta_path,
@@ -795,6 +931,14 @@ class DraftFile:
                 "boot_id": boot_id(), "process_start": process_start(os.getpid()),
             }).encode(),
         )
+
+    def unassign(self, pane_id: str) -> None:
+        if self.unassigned:
+            return
+        meta = json.loads(self.meta_path.read_text())
+        meta.update(key=pane_key(pane_id), entry_id=None)
+        atomic_write(self.meta_path, json.dumps(meta).encode())
+        self.unassigned = True
 
     def save(self, text: str, now: float, force: bool = False) -> None:
         if text == self.saved or (not force and now - self.saved_at < self.SAVE_INTERVAL_SECONDS):
@@ -976,7 +1120,8 @@ class EditBuffer:
 EDITOR_HINTS = [("esc", "save"), ("enter", "new line"), ("ctrl+c", "discard")]
 
 
-def edit_prompt(screen, store: Store, conversation: Conversation, title: str, initial: str, entry_id: str | None) -> str | None:
+def edit_prompt(screen, store: Store, conversation: Conversation, title: str, initial: str, entry_id: str | None,
+                *, owner_check=None) -> str | None:
     """Edit a prompt in the popup. Esc saves; ctrl+c discards.
 
     Returns the new text, or None when it was discarded, left empty, or unchanged.
@@ -985,6 +1130,8 @@ def edit_prompt(screen, store: Store, conversation: Conversation, title: str, in
 
     buffer = EditBuffer(initial)
     draft = DraftFile(store, conversation, initial, entry_id)
+    if owner_check and not owner_check():
+        draft.unassign(conversation.pane_id)
     scroll = 0
     curses.curs_set(1)
     try:
@@ -1010,6 +1157,8 @@ def edit_prompt(screen, store: Store, conversation: Conversation, title: str, in
             try:
                 while True:
                     if key in ("\x1b", "\x11"):
+                        if owner_check and not owner_check():
+                            draft.unassign(conversation.pane_id)
                         return finish_edit(buffer.text, initial)
                     if key == "\x03":
                         return None
@@ -1020,7 +1169,11 @@ def edit_prompt(screen, store: Store, conversation: Conversation, title: str, in
                         break
             finally:
                 screen.nodelay(False)
-            draft.save(buffer.text, time.time())
+            now = time.time()
+            if buffer.text != draft.saved and now - draft.saved_at >= draft.SAVE_INTERVAL_SECONDS:
+                if owner_check and not owner_check():
+                    draft.unassign(conversation.pane_id)
+                draft.save(buffer.text, now)
     finally:
         draft.remove()
         curses.curs_set(0)
@@ -1096,13 +1249,14 @@ class QueueApp:
         self.mode = "queue"
         self.message = ""
         self.confirm_delete: str | None = None
+        self.editor_unassigned = False
 
     # data ---------------------------------------------------------------
 
     def load(self) -> None:
         try:
             pane = self.herdr.pane(self.pane_id)
-            self.conversation = conversation_for_pane(pane)
+            self.conversation = resolved_conversation(self.herdr, pane)
             self.is_agent = bool(pane.get("agent"))
             if self.is_agent:
                 remember_pane_key(self.store.directory, self.conversation)
@@ -1110,12 +1264,10 @@ class QueueApp:
             self.conversation = fallback_conversation(self.pane_id)
             self.message = f"Herdr unavailable ({exc.code}); showing the pane queue"
         with self.store.transaction() as data:
-            if adopt_pane_queue(data, self.conversation):
-                self.message = "Moved this pane's earlier queue into the conversation"
             queue = queue_for(data, self.conversation.key)
             if queue is not None:
                 touch_queue(queue, self.conversation)
-        recovered = recover_drafts(self.store, self.conversation)
+        recovered = recover_unassigned_drafts(self.store) + recover_drafts(self.store, self.conversation)
         if recovered:
             self.message = f"Recovered {recovered} unsaved draft(s)"
         self.refresh()
@@ -1134,7 +1286,12 @@ class QueueApp:
         )
         self.selected = min(self.selected, max(len(self.entries) - 1, 0))
         self.other_selected = min(self.other_selected, max(len(self.others) - 1, 0))
-        report_count(self.herdr, self.store.directory, self.pane_id, len(self.entries))
+        try:
+            current = resolved_conversation(self.herdr, self.herdr.pane(self.pane_id))
+            count = len(self.entries) if current.key == self.conversation.key else 0
+        except HerdrError:
+            count = 0
+        report_count(self.herdr, self.store.directory, self.pane_id, count)
 
     def current(self) -> dict[str, Any] | None:
         return self.entries[self.selected] if self.entries else None
@@ -1152,10 +1309,11 @@ class QueueApp:
         if text is None:
             self.message = "Nothing added"
             return
-        index = self.selected + 1 if self.entries else None
-        self.mutate(lambda data: add_entry(data, self.conversation, text, index))
+        target = self.editor_destination()
+        index = self.selected + 1 if self.entries and target.key == self.conversation.key else None
+        self.mutate(lambda data: add_entry(data, target, text, index))
         self.selected = index if index is not None else 0
-        self.message = "Added"
+        self.message = "Added" if target.key == self.conversation.key else "Saved separately under Other; conversation changed"
 
     def edit(self, screen) -> None:
         entry = self.current()
@@ -1165,8 +1323,13 @@ class QueueApp:
         if text is None:
             self.message = "Unchanged"
             return
-        self.mutate(lambda data: edit_entry(ensure_queue(data, self.conversation), entry["id"], text))
-        self.message = "Saved"
+        target = self.editor_destination()
+        if target.key == self.conversation.key:
+            self.mutate(lambda data: edit_entry(ensure_queue(data, target), entry["id"], text))
+            self.message = "Saved"
+        else:
+            self.mutate(lambda data: add_entry(data, target, text))
+            self.message = "Saved separately under Other; original prompt unchanged"
 
     def delete(self) -> None:
         entry = self.current()
@@ -1199,9 +1362,10 @@ class QueueApp:
         if not entry:
             return False
         try:
-            self.herdr.paste(self.pane_id, entry["text"])
-        except HerdrError as exc:
-            self.message = f"Insert failed: {exc.message or exc.code}"
+            current = delivery_conversation(self.herdr, self.conversation)
+            self.herdr.paste(self.pane_id, entry["text"], expected=current)
+        except (HerdrError, QueueError) as exc:
+            self.message = f"Insert failed: {exc}"
             return False
         self.mutate(lambda data: mark_pending(ensure_queue(data, self.conversation), entry["id"], self.pane_id, time.time()))
         return True
@@ -1211,9 +1375,10 @@ class QueueApp:
         if not entry:
             return False
         try:
-            self.herdr.submit(self.pane_id, entry["text"], self.is_agent)
-        except HerdrError as exc:
-            self.message = f"Send failed: {exc.message or exc.code}"
+            current = delivery_conversation(self.herdr, self.conversation)
+            self.herdr.submit(self.pane_id, entry["text"], bool(current.agent), expected=current)
+        except (HerdrError, QueueError) as exc:
+            self.message = f"Send failed: {exc}"
             return False
         self.mutate(lambda data: remove_entry(ensure_queue(data, self.conversation), entry["id"], "sent"))
         return True
@@ -1221,6 +1386,7 @@ class QueueApp:
     def adopt_other(self) -> None:
         if not self.others:
             return
+        delivery_conversation(self.herdr, self.conversation)
         key, _ = self.others[self.other_selected]
         moved = self.mutate(lambda data: merge_queue(data, key, self.conversation))
         self.message = f"Moved {moved} prompt(s) into this conversation"
@@ -1240,7 +1406,22 @@ class QueueApp:
 
     def with_editor(self, screen, initial: str, entry_id: str | None) -> str | None:
         title = "Edit prompt" if entry_id else "Add prompt"
-        return edit_prompt(screen, self.store, self.conversation, title, initial, entry_id)
+        self.editor_unassigned = False
+
+        def owner_check():
+            self.editor_destination()
+            return not self.editor_unassigned
+
+        return edit_prompt(screen, self.store, self.conversation, title, initial, entry_id,
+                           owner_check=owner_check)
+
+    def editor_destination(self) -> Conversation:
+        if not self.editor_unassigned:
+            try:
+                return delivery_conversation(self.herdr, self.conversation)
+            except (QueueError, HerdrError):
+                self.editor_unassigned = True
+        return fallback_conversation(self.pane_id)
 
     # drawing ------------------------------------------------------------
 
@@ -1493,7 +1674,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
         # Herdr keeps the session binding after the agent exits so it can resume
         # it, so an agent that left the pane also ends the conversation here.
         agent_left = event_name == "pane.agent_detected" and not pane.get("agent")
-        current = conversation_for_pane(pane)
+        current = resolved_conversation(herdr, pane)
         warn_if_ended(store, herdr, pane_id, None if agent_left else current.key)
         sync_pane(store, herdr, pane, working=data_section.get("agent_status") == "working")
     except (HerdrError, QueueError):
@@ -1508,6 +1689,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
             (store.directory / name).unlink()
     if not store.path.exists() and not drafts_dir(store).is_dir():
         return 0
+    recover_unassigned_drafts(store)
     herdr = Herdr()
     for pane in herdr.panes():
         with contextlib.suppress(HerdrError, QueueError):
@@ -1554,7 +1736,6 @@ def cmd_add(args: argparse.Namespace) -> int:
     conversation = resolve(herdr, target_pane(args), store.directory)
     text = read_text_argument(args.text)
     with store.transaction() as data:
-        adopt_pane_queue(data, conversation)
         entry = add_entry(data, conversation, text, 0 if args.top else None)
         count = entry_count(data, conversation.key)
     report_count(herdr, store.directory, conversation.pane_id, count)
@@ -1562,8 +1743,8 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
-def with_conversation_queue(args: argparse.Namespace, action) -> Any:
-    store, herdr = Store(args.state_dir), Herdr()
+def with_conversation_queue(args: argparse.Namespace, action, *, herdr: Herdr | None = None) -> Any:
+    store, herdr = Store(args.state_dir), herdr if herdr is not None else Herdr()
     conversation = resolve(herdr, target_pane(args), store.directory)
     with store.transaction() as data:
         queue = queue_for(data, conversation.key)
@@ -1598,26 +1779,26 @@ def cmd_insert(args: argparse.Namespace) -> int:
     herdr = Herdr()
     pane = target_pane(args)
 
-    def action(queue: dict[str, Any], _: Conversation) -> None:
+    def action(queue: dict[str, Any], conversation: Conversation) -> None:
         _, entry = find_entry(queue, args.id)
-        herdr.paste(pane, entry["text"])
+        current = delivery_conversation(herdr, conversation)
+        herdr.paste(pane, entry["text"], expected=current)
         mark_pending(queue, entry["id"], pane, time.time())
 
-    with_conversation_queue(args, action)
+    with_conversation_queue(args, action, herdr=herdr)
     return 0
 
 
 def cmd_send(args: argparse.Namespace) -> int:
     herdr = Herdr()
     pane = target_pane(args)
-    is_agent = bool(herdr.pane(pane).get("agent"))
-
-    def action(queue: dict[str, Any], _: Conversation) -> None:
+    def action(queue: dict[str, Any], conversation: Conversation) -> None:
         _, entry = find_entry(queue, args.id)
-        herdr.submit(pane, entry["text"], is_agent)
+        current = delivery_conversation(herdr, conversation)
+        herdr.submit(pane, entry["text"], bool(current.agent), expected=current)
         remove_entry(queue, entry["id"], "sent")
 
-    with_conversation_queue(args, action)
+    with_conversation_queue(args, action, herdr=herdr)
     return 0
 
 

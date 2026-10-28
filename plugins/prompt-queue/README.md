@@ -105,8 +105,10 @@ A queue is keyed by the agent's native session reference, the
 and uses to resume the agent after a restart. When Herdr or the AgentHost
 session guard brings the conversation back, in the same pane or another one,
 its queue comes back with it. Panes without a session reference use a
-`pane:<id>` queue. When that pane later reports a session, its entries move
-into the session's queue.
+`pane:<id>` queue. Its entries remain separate when a native session later
+appears: a reused pane does not prove ownership of earlier prompts. Use `o`
+and deliberately select that earlier queue to move it into the current native
+conversation. Queued content and history remain available until that choice.
 
 If a conversation comes back under a new session ID, its old queue stays
 intact. Use `o` to move it into the current conversation.
@@ -124,6 +126,52 @@ submission. Recovery does not paste or submit messages. A live reconciliation
 with the same input runtime preserves insertion tracking; a server handoff
 that replaces the socket conservatively clears it and retains the prompt.
 
+Insert, Send, and moving another queue into the current conversation recheck the
+live native conversation identity immediately before acting. If the identity is
+missing, the agent exited, or the pane now hosts a different conversation, the
+action stops and keeps the queued entries unchanged. Reopen the queue for the
+intended conversation before trying again. A native conversation can keep its
+queue when it resumes in another pane or working directory.
+
+Codex also requires the managed `session-id` terminal title component first
+(after its optional spinner), followed by `project`. This detects an idle
+`/new` or `/resume` before a delayed session hook replaces the previous native
+binding. Codex 0.165.0 can shorten that component to a UUID prefix with `...`;
+the prefix must match the native binding. Existing Codex processes with the
+older project-only title need to load that setting through their next `/new`,
+`/resume`, or reopen before queue delivery is available. Queued data remains
+saved throughout; no model call is needed. Claude delivery uses its freshly
+checked native binding.
+
+The selected Codex UUID must also be the unique match among writer-lock
+descriptors held by the exact pane's live Codex process. The check verifies
+Linux process owner, executable, working directory and start identity. Missing
+process evidence or two UUIDs with the same displayed prefix leave the queue
+unassigned. This proof reads process metadata and descriptor targets only.
+
+While a Codex title disagrees with its retained binding, new prompts go into
+the unassigned pane queue. Add/Edit in an already-open popup also checks
+ownership after editing; changed text is saved separately if the conversation
+changed, preserving the original entry. Draft saves retain that unassigned
+status once ownership is lost. A different conversation starting work cannot
+consume the previous conversation's inserted prompt: its insertion marker is
+cleared conservatively and the queued prompt remains available.
+
+Binding reconcilers can invoke the safe `reconcile` plugin action to refresh
+original-conversation recovery and sidebar counts after an idle identity
+change. It runs the same reconciliation as plugin startup and never pastes or
+submits entries.
+
+Delivery requires the additive `pane.send_input_checked` and
+`agent.prompt_checked` APIs in the managed HERDR build. Each request carries the
+fresh terminal ID, complete native binding, and exact raw terminal title. The
+server compares those facts before queuing input in the same dispatch, closing
+the gap between the plugin's read and delivery request. Insert retains bracketed
+paste without Enter; Send retains the normal agent-prompt submission behavior.
+If the capability is missing or any precondition changed, the plugin retains the
+entry and does not fall back to an unchecked input method. It does not retry an
+uncertain delivery automatically.
+
 ## Crash durability
 
 State lives in `~/.local/state/herdr/plugins/joeguice.prompt-queue/`:
@@ -140,6 +188,9 @@ State lives in `~/.local/state/herdr/plugins/joeguice.prompt-queue/`:
   so a reused PID cannot keep a pre-restart draft hidden. If the queued entry
   has a newer edit, recovery keeps it and adds the abandoned draft separately.
   Invalid or oversized drafts stay on disk for manual recovery.
+  Abandoned drafts created without a native identity recover into their original
+  `pane:<id>` queue and are visible under `o`, without assigning them to whichever
+  conversation later occupies the pane.
 - `reported-counts.json`: a disposable cache of sidebar counts. The startup
   hook rebuilds it.
 

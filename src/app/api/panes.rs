@@ -1,20 +1,20 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams,
+    PaneClearAgentSessionParams, PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection,
+    PaneCopySearchParams, PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
+    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
+    PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionCheckedParams,
+    PaneReportAgentSessionParams, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneScrollParams, PaneSelectionReadParams, PaneSendInputCheckedParams,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSessionExpectation,
+    PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint,
+    PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -29,6 +29,40 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+fn without_codex_spinner(title: Option<&str>) -> Option<&str> {
+    title.map(|title| {
+        let Some(first) = title.chars().next() else {
+            return title;
+        };
+        if !('\u{2800}'..='\u{28ff}').contains(&first) {
+            return title;
+        }
+        let rest = &title[first.len_utf8()..];
+        rest.strip_prefix(" | ")
+            .or_else(|| rest.strip_prefix(' '))
+            .unwrap_or(title)
+    })
+}
+
+fn codex_title_matches_session(title: Option<&str>, session_id: &str) -> bool {
+    let title = title.unwrap_or("");
+    let item = title
+        .split(" | ")
+        .find(|item| {
+            *item != "Action Required"
+                && !(item.chars().count() == 1
+                    && item.chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)))
+        })
+        .unwrap_or("");
+    let item = item
+        .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+        .trim_start();
+    item == session_id
+        || item
+            .strip_suffix("...")
+            .is_some_and(|prefix| prefix.len() == 29 && session_id.starts_with(prefix))
+}
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1909,6 +1943,198 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Verify all observable ownership in the same app dispatch as the action.
+    /// A changed/missing expectation never falls back to an unchecked endpoint.
+    pub(super) fn validate_pane_session_expectation(
+        &self,
+        id: &str,
+        pane_id: &str,
+        expected: &PaneSessionExpectation,
+    ) -> Result<(usize, PaneId), String> {
+        let Some((ws_idx, internal)) = self.parse_pane_id(pane_id) else {
+            return Err(pane_not_found(id.to_string(), pane_id));
+        };
+        let Some(pane) = self.pane_info(ws_idx, internal) else {
+            return Err(pane_not_found(id.to_string(), pane_id));
+        };
+        if expected.expected_terminal_id.is_empty()
+            || expected
+                .expected_agent_session
+                .as_ref()
+                .is_some_and(|session| {
+                    !crate::agent_resume::is_official_agent_source(&session.source, &session.agent)
+                        || pane.agent.as_deref() != Some(session.agent.as_str())
+                })
+            || pane.terminal_id != expected.expected_terminal_id
+            || pane.agent_session != expected.expected_agent_session
+            || (if pane.agent.as_deref() == Some("codex") {
+                without_codex_spinner(pane.terminal_title.as_deref())
+                    != without_codex_spinner(expected.expected_terminal_title.as_deref())
+            } else {
+                pane.terminal_title != expected.expected_terminal_title
+            })
+        {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_session_changed",
+                "pane terminal, native conversation, or terminal title changed",
+            ));
+        }
+        Ok((ws_idx, internal))
+    }
+
+    pub(super) fn validate_input_session_expectation(
+        &self,
+        id: &str,
+        pane_id: &str,
+        expected: &PaneSessionExpectation,
+    ) -> Result<(), String> {
+        self.validate_pane_session_expectation(id, pane_id, expected)?;
+        let Some(session) = expected.expected_agent_session.as_ref() else {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_session_changed",
+                "native conversation is missing",
+            ));
+        };
+        if session.agent == "codex"
+            && !codex_title_matches_session(
+                expected.expected_terminal_title.as_deref(),
+                &session.value,
+            )
+        {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_session_changed",
+                "selected Codex conversation does not match native binding",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn handle_pane_report_agent_session_checked(
+        &mut self,
+        id: String,
+        params: PaneReportAgentSessionCheckedParams,
+    ) -> String {
+        let (ws_idx, pane_id) =
+            match self.validate_pane_session_expectation(&id, &params.pane_id, &params.expected) {
+                Ok(resolved) => resolved,
+                Err(error) => return error,
+            };
+        if !crate::agent_resume::is_official_agent_source(&params.source, &params.agent)
+            || self
+                .pane_info(ws_idx, pane_id)
+                .and_then(|pane| pane.agent)
+                .as_deref()
+                != Some(params.agent.as_str())
+            || (params.agent == "codex"
+                && !codex_title_matches_session(
+                    params.expected.expected_terminal_title.as_deref(),
+                    &params.agent_session_id,
+                ))
+        {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "reported conversation does not match selected conversation",
+            );
+        }
+        let requested = crate::api::schema::AgentSessionInfo {
+            source: params.source.clone(),
+            agent: params.agent.clone(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: params.agent_session_id.clone(),
+        };
+        let response = self.handle_pane_report_agent_session(
+            id.clone(),
+            PaneReportAgentSessionParams {
+                pane_id: params.pane_id,
+                source: params.source,
+                agent: params.agent,
+                seq: params.seq,
+                agent_session_id: Some(params.agent_session_id),
+                agent_session_path: None,
+                session_start_source: params.session_start_source,
+                resume_argv: None,
+            },
+        );
+        if self
+            .pane_info(ws_idx, pane_id)
+            .and_then(|pane| pane.agent_session)
+            .as_ref()
+            != Some(&requested)
+        {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "native conversation report was not applied",
+            );
+        }
+        response
+    }
+
+    pub(super) fn handle_pane_clear_agent_session(
+        &mut self,
+        id: String,
+        params: PaneClearAgentSessionParams,
+    ) -> String {
+        let (ws_idx, pane_id) =
+            match self.validate_pane_session_expectation(&id, &params.pane_id, &params.expected) {
+                Ok(resolved) => resolved,
+                Err(error) => return error,
+            };
+        let Some(session) = params.expected.expected_agent_session.as_ref() else {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "native conversation is missing",
+            );
+        };
+        let updates =
+            self.state
+                .clear_agent_session_for_api(pane_id, &session.source, &session.agent);
+        for update in updates {
+            self.emit_pane_state_update(&update);
+        }
+        self.state.mark_session_dirty();
+        self.emit_pane_updated(ws_idx, pane_id);
+        if self
+            .pane_info(ws_idx, pane_id)
+            .is_none_or(|pane| pane.agent_session.is_some())
+        {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "native conversation clear was not applied",
+            );
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_send_input_checked(
+        &mut self,
+        id: String,
+        params: PaneSendInputCheckedParams,
+    ) -> String {
+        if let Err(error) = self.validate_checked_agent_input(&id, &params.pane_id, &params.text) {
+            return error;
+        }
+        if let Err(error) =
+            self.validate_input_session_expectation(&id, &params.pane_id, &params.expected)
+        {
+            return error;
+        }
+        self.handle_pane_send_input(
+            id,
+            PaneSendInputParams {
+                pane_id: params.pane_id,
+                text: params.text,
+                keys: Vec::new(),
+            },
+        )
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
@@ -2385,6 +2611,339 @@ mod tests {
             crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
         app.state.insert_test_runtime(pane_id, runtime);
         (app, public_pane_id, rx)
+    }
+
+    fn app_with_session_guard() -> (
+        App,
+        String,
+        PaneSessionExpectation,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let (mut app, pane_id, rx) = app_with_send_key_runtime(8);
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(internal)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_terminal_title(Some("session-a | project".into()));
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("session-a").unwrap(),
+        });
+        let pane = app.pane_info(0, internal).unwrap();
+        let expected = PaneSessionExpectation {
+            expected_terminal_id: pane.terminal_id,
+            expected_agent_session: pane.agent_session,
+            expected_terminal_title: pane.terminal_title,
+        };
+        (app, pane_id, expected, rx)
+    }
+
+    #[tokio::test]
+    async fn checked_clear_removes_official_session_without_releasing_detected_agent() {
+        let (mut app, pane_id, expected, _rx) = app_with_session_guard();
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let response = app.handle_pane_clear_agent_session(
+            "clear".into(),
+            PaneClearAgentSessionParams { pane_id, expected },
+        );
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+        let pane = app.pane_info(0, internal).unwrap();
+        assert!(pane.agent_session.is_none());
+        assert_eq!(pane.agent.as_deref(), Some("codex"));
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+        assert!(app.state.session_dirty);
+    }
+
+    #[tokio::test]
+    async fn checked_clear_refuses_changed_identity_terminal_title_and_foreign_owner() {
+        for changed in ["session", "terminal", "title", "source", "agent"] {
+            let (mut app, pane_id, mut expected, mut rx) = app_with_session_guard();
+            match changed {
+                "session" => {
+                    expected.expected_agent_session.as_mut().unwrap().value = "session-b".into()
+                }
+                "terminal" => expected.expected_terminal_id = "replacement-terminal".into(),
+                "title" => expected.expected_terminal_title = Some("different selection".into()),
+                "source" => {
+                    expected.expected_agent_session.as_mut().unwrap().source = "foreign".into()
+                }
+                "agent" => {
+                    let internal = app.state.workspaces[0].tabs[0].root_pane;
+                    let tid = app.state.workspaces[0]
+                        .terminal_id(internal)
+                        .unwrap()
+                        .clone();
+                    app.state.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Claude);
+                }
+                _ => unreachable!(),
+            }
+            let response = app.handle_pane_clear_agent_session(
+                "clear".into(),
+                PaneClearAgentSessionParams { pane_id, expected },
+            );
+            let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.error.code, "agent_session_changed");
+            let internal = app.state.workspaces[0].tabs[0].root_pane;
+            assert_eq!(
+                app.pane_info(0, internal)
+                    .unwrap()
+                    .agent_session
+                    .unwrap()
+                    .value,
+                "session-a"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_input_inserts_without_enter_and_refuses_changed_session() {
+        let (mut app, pane_id, expected, mut rx) = app_with_session_guard();
+        let response = app.handle_pane_send_input_checked(
+            "insert".into(),
+            PaneSendInputCheckedParams {
+                pane_id: pane_id.clone(),
+                text: "safe prompt".into(),
+                expected: expected.clone(),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"safe prompt"));
+        assert!(rx.try_recv().is_err());
+        let mut changed = expected;
+        changed.expected_agent_session.as_mut().unwrap().value = "session-b".into();
+        let response = app.handle_pane_send_input_checked(
+            "insert".into(),
+            PaneSendInputCheckedParams {
+                pane_id,
+                text: "must not reach pane".into(),
+                expected: changed,
+            },
+        );
+        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.error.code, "agent_session_changed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn checked_report_binds_unbound_and_replaces_saved_session_only_for_selected_title() {
+        for unbound in [false, true] {
+            let (mut app, pane_id, mut expected, _rx) = app_with_session_guard();
+            let internal = app.state.workspaces[0].tabs[0].root_pane;
+            if unbound {
+                let _ = app.handle_pane_clear_agent_session(
+                    "clear".into(),
+                    PaneClearAgentSessionParams {
+                        pane_id: pane_id.clone(),
+                        expected: expected.clone(),
+                    },
+                );
+                expected.expected_agent_session = None;
+            }
+            let tid = app.state.workspaces[0]
+                .terminal_id(internal)
+                .unwrap()
+                .clone();
+            app.state
+                .terminals
+                .get_mut(&tid)
+                .unwrap()
+                .set_terminal_title(Some("session-b | repo".into()));
+            expected.expected_terminal_title = Some("session-b | repo".into());
+            let params = PaneReportAgentSessionCheckedParams {
+                pane_id: pane_id.clone(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                agent_session_id: "session-c".into(),
+                seq: None,
+                session_start_source: Some("resume".into()),
+                expected: expected.clone(),
+            };
+            let denied =
+                app.handle_pane_report_agent_session_checked("deny".into(), params.clone());
+            let denied: ErrorResponse = serde_json::from_str(&denied).unwrap();
+            assert_eq!(denied.error.code, "agent_session_changed");
+            assert_eq!(
+                app.pane_info(0, internal).unwrap().agent_session,
+                expected.expected_agent_session
+            );
+            let response = app.handle_pane_report_agent_session_checked(
+                "report".into(),
+                PaneReportAgentSessionCheckedParams {
+                    agent_session_id: "session-b".into(),
+                    ..params
+                },
+            );
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                app.pane_info(0, internal)
+                    .unwrap()
+                    .agent_session
+                    .unwrap()
+                    .value,
+                "session-b"
+            );
+            assert!(app.state.session_dirty);
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_input_accepts_spinner_advance_but_rejects_selected_conversation_change() {
+        let (mut app, pane_id, mut expected, mut rx) = app_with_session_guard();
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let tid = app.state.workspaces[0]
+            .terminal_id(internal)
+            .unwrap()
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_terminal_title(Some("⠋ | session-a | project".into()));
+        expected.expected_terminal_title = Some("⠙ | session-a | project".into());
+        let response = app.handle_pane_send_input_checked(
+            "insert".into(),
+            PaneSendInputCheckedParams {
+                pane_id: pane_id.clone(),
+                text: "safe".into(),
+                expected: expected.clone(),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"safe"));
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_terminal_title(Some("session-b | project".into()));
+        expected.expected_terminal_title = Some("session-b | project".into());
+        let denied = app.handle_pane_send_input_checked(
+            "deny".into(),
+            PaneSendInputCheckedParams {
+                pane_id,
+                text: "wrong".into(),
+                expected,
+            },
+        );
+        let denied: ErrorResponse = serde_json::from_str(&denied).unwrap();
+        assert_eq!(denied.error.code, "agent_session_changed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn checked_clear_handles_sequenced_reports_and_refuses_hidden_foreign_authority() {
+        let (mut app, pane_id, expected, _rx) = app_with_session_guard();
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let tid = app.state.workspaces[0]
+            .terminal_id(internal)
+            .unwrap()
+            .clone();
+        let _ = app.handle_pane_report_agent_session(
+            "seed".into(),
+            PaneReportAgentSessionParams {
+                pane_id: pane_id.clone(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                seq: Some(100),
+                agent_session_id: Some("session-a".into()),
+                agent_session_path: None,
+                session_start_source: Some("resume".into()),
+                resume_argv: None,
+            },
+        );
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_hook_authority(
+                "foreign".into(),
+                "codex".into(),
+                AgentState::Idle,
+                None,
+                None,
+            );
+        assert_eq!(
+            app.state.terminals[&tid]
+                .hook_authority
+                .as_ref()
+                .unwrap()
+                .source,
+            "foreign"
+        );
+        let denied = app.handle_pane_clear_agent_session(
+            "deny".into(),
+            PaneClearAgentSessionParams {
+                pane_id: pane_id.clone(),
+                expected: expected.clone(),
+            },
+        );
+        let denied: ErrorResponse = serde_json::from_str(&denied).unwrap();
+        assert_eq!(denied.error.code, "agent_session_changed");
+        assert!(app.pane_info(0, internal).unwrap().agent_session.is_some());
+        app.state.terminals.get_mut(&tid).unwrap().hook_authority = None;
+        let cleared = app.handle_pane_clear_agent_session(
+            "clear".into(),
+            PaneClearAgentSessionParams { pane_id, expected },
+        );
+        let _: SuccessResponse = serde_json::from_str(&cleared).unwrap();
+        assert!(app.pane_info(0, internal).unwrap().agent_session.is_none());
+        assert!(!app.state.terminals[&tid].hook_report_is_newer("herdr:codex", Some(100)));
+    }
+
+    #[tokio::test]
+    async fn checked_report_refuses_false_success_when_sequence_is_stale() {
+        let (mut app, pane_id, mut expected, _rx) = app_with_session_guard();
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let tid = app.state.workspaces[0]
+            .terminal_id(internal)
+            .unwrap()
+            .clone();
+        let _ = app.handle_pane_report_agent_session(
+            "seed".into(),
+            PaneReportAgentSessionParams {
+                pane_id: pane_id.clone(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                seq: Some(100),
+                agent_session_id: Some("session-a".into()),
+                agent_session_path: None,
+                session_start_source: Some("resume".into()),
+                resume_argv: None,
+            },
+        );
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_terminal_title(Some("session-b | repo".into()));
+        expected.expected_terminal_title = Some("session-b | repo".into());
+        let denied = app.handle_pane_report_agent_session_checked(
+            "deny".into(),
+            PaneReportAgentSessionCheckedParams {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                agent_session_id: "session-b".into(),
+                seq: Some(99),
+                session_start_source: Some("resume".into()),
+                expected,
+            },
+        );
+        let denied: ErrorResponse = serde_json::from_str(&denied).unwrap();
+        assert_eq!(denied.error.code, "agent_session_changed");
+        assert_eq!(
+            app.pane_info(0, internal)
+                .unwrap()
+                .agent_session
+                .unwrap()
+                .value,
+            "session-a"
+        );
     }
 
     fn app_with_scrollback_runtime() -> (App, String, PaneId) {

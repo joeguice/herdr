@@ -11,18 +11,35 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import prompt_queue as pq  # noqa: E402
 
+REAL_HERDR = pq.Herdr
+
 
 def claude_pane(pane_id="w1:p1", session="sess-1"):
-    pane = {"pane_id": pane_id, "agent": "claude", "cwd": "/repo/project"}
+    pane = {"pane_id": pane_id, "agent": "claude", "cwd": "/repo/project",
+            "terminal_id": "term_" + pane_id}
     if session:
         pane["agent_session"] = {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": session}
     return pane
+
+
+CODEX_SESSION = "01a14008-062c-7a10-999f-81da2f6fbcfb"
+
+
+def codex_pane(title=None):
+    return {
+        "pane_id": "w1:p1", "agent": "codex", "cwd": "/repo/project",
+        "terminal_id": "term_w1:p1",
+        "agent_session": {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": CODEX_SESSION},
+        "terminal_title_stripped": title if title is not None else CODEX_SESSION + " | project",
+        "terminal_title": title if title is not None else CODEX_SESSION + " | project",
+    }
 
 
 class FakeHerdr:
     def __init__(self, panes):
         self.panes_by_id = {pane["pane_id"]: pane for pane in panes}
         self.calls = []
+        self.codex_lock_ids = [CODEX_SESSION]
 
     def pane(self, pane_id):
         if pane_id not in self.panes_by_id:
@@ -32,10 +49,15 @@ class FakeHerdr:
     def panes(self):
         return list(self.panes_by_id.values())
 
-    def paste(self, pane_id, text):
+    def selected_codex_session(self, pane):
+        prefix = pq.codex_title_prefix(pane)
+        selected = [sid for sid in self.codex_lock_ids if prefix and sid.startswith(prefix)]
+        return selected[0] if len(selected) == 1 else None
+
+    def paste(self, pane_id, text, *, expected):
         self.calls.append(("paste", pane_id, text))
 
-    def submit(self, pane_id, text, is_agent):
+    def submit(self, pane_id, text, is_agent, *, expected):
         self.calls.append(("submit", pane_id, text, is_agent))
 
     def report_count(self, pane_id, count):
@@ -43,6 +65,91 @@ class FakeHerdr:
 
     def notify(self, title, body):
         self.calls.append(("notify", title, body))
+
+
+class CheckedTransportTests(unittest.TestCase):
+    def test_insert_uses_only_checked_bracketed_paste_endpoint(self):
+        client = pq.Herdr("unused")
+        expected = pq.conversation_for_pane({**claude_pane(), "terminal_title": "Claude session"})
+        with mock.patch.object(client, "request", return_value={}) as request:
+            client.paste("w1:p1", "queued text", expected=expected)
+        request.assert_called_once_with("pane.send_input_checked", {
+            "pane_id": "w1:p1", "text": "queued text", "expected_terminal_id": "term_w1:p1",
+            "expected_agent_session": expected.session, "expected_terminal_title": "Claude session"})
+
+    def test_send_uses_only_checked_agent_prompt_and_explicit_null_title(self):
+        client = pq.Herdr("unused")
+        expected = pq.conversation_for_pane(claude_pane())
+        with mock.patch.object(client, "request", return_value={}) as request:
+            client.submit("w1:p1", "queued text", True, expected=expected)
+        request.assert_called_once_with("agent.prompt_checked", {
+            "target": "w1:p1", "text": "queued text", "expected_terminal_id": "term_w1:p1",
+            "expected_agent_session": expected.session, "expected_terminal_title": None})
+
+    def test_unavailable_checked_methods_never_fall_back_to_legacy_input(self):
+        client = pq.Herdr("unused")
+        expected = pq.conversation_for_pane(claude_pane())
+        for name, action in (("pane.send_input_checked", lambda: client.paste("w1:p1", "kept", expected=expected)),
+                             ("agent.prompt_checked", lambda: client.submit("w1:p1", "kept", True, expected=expected))):
+            with self.subTest(method=name):
+                with mock.patch.object(client, "request", side_effect=pq.HerdrError("unknown_method", "checked API required")) as request:
+                    with self.assertRaises(pq.HerdrError):
+                        action()
+                    self.assertEqual(request.call_count, 1)
+                    self.assertEqual(request.call_args.args[0], name)
+
+    def test_missing_terminal_identity_refuses_before_request(self):
+        client = pq.Herdr("unused")
+        expected = pq.conversation_for_pane(claude_pane())
+        expected.terminal_id = None
+        with mock.patch.object(client, "request") as request:
+            with self.assertRaises(pq.QueueError):
+                client.paste("w1:p1", "kept", expected=expected)
+            request.assert_not_called()
+
+
+class CodexProcessProofTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.cwd = self.root / "repo"
+        self.cwd.mkdir()
+        self.locks = self.root / "codex/thread-writer-locks"
+        self.proc = self.root / "proc"
+        self.process = self.proc / "123"
+        (self.process / "fd").mkdir(parents=True)
+        (self.process / "exe").symlink_to(self.root / "bin/codex")
+        (self.process / "cwd").symlink_to(self.cwd)
+        (self.process / "stat").write_text("123 (codex) S " + "0 " * 18 + "123456\n")
+        (self.process / "fd/55").symlink_to(self.locks / (CODEX_SESSION + ".lock"))
+        self.pane = {**codex_pane(CODEX_SESSION[:29] + "... | project"), "cwd": str(self.cwd)}
+        self.info = {"pane_id": "w1:p1", "foreground_processes": [
+            {"name": "codex", "pid": 123, "cwd": str(self.cwd)}]}
+        self.herdr = pq.Herdr(proc_root=self.proc, codex_locks=self.locks)
+        self.request = mock.patch.object(self.herdr, "request", return_value={"process_info": self.info})
+        self.request.start()
+        self.addCleanup(self.request.stop)
+
+    def test_one_unique_matching_uuid_is_resolved_among_unrelated_retained_locks(self):
+        (self.process / "fd/56").symlink_to(self.locks / "01a14008-062c-7a10-888f-81da2f6fbcfb.lock")
+        self.assertEqual(self.herdr.selected_codex_session(self.pane), CODEX_SESSION)
+        self.assertEqual(pq.resolved_conversation(self.herdr, self.pane).session["value"], CODEX_SESSION)
+
+    def test_two_matching_uuid_prefixes_refuse_native_ownership(self):
+        (self.process / "fd/56").symlink_to(self.locks / (CODEX_SESSION[:-1] + "c.lock"))
+        self.assertIsNone(self.herdr.selected_codex_session(self.pane))
+        self.assertEqual(pq.resolved_conversation(self.herdr, self.pane).key, "pane:w1:p1")
+
+    def test_unavailable_wrong_pane_and_wrong_process_evidence_fail_closed(self):
+        self.info["pane_id"] = "other:pane"
+        self.assertIsNone(self.herdr.selected_codex_session(self.pane))
+        self.info["pane_id"] = "w1:p1"
+        (self.process / "exe").unlink()
+        (self.process / "exe").symlink_to(self.root / "bin/python")
+        self.assertIsNone(self.herdr.selected_codex_session(self.pane))
+        with mock.patch.object(self.herdr, "request", side_effect=pq.HerdrError("unavailable", "test")):
+            self.assertIsNone(self.herdr.selected_codex_session(self.pane))
 
 
 class StoreTests(unittest.TestCase):
@@ -102,6 +209,13 @@ class StoreTests(unittest.TestCase):
 
 
 class ConversationTests(unittest.TestCase):
+    def test_incomplete_or_different_agent_binding_remains_unassigned(self):
+        for field, value in (("source", ""), ("agent", "codex"), ("kind", None), ("value", "")):
+            with self.subTest(field=field):
+                pane = claude_pane()
+                pane["agent_session"][field] = value
+                self.assertEqual(pq.conversation_for_pane(pane).key, "pane:w1:p1")
+
     def test_session_binding_is_the_key(self):
         conversation = pq.conversation_for_pane(claude_pane())
         self.assertEqual(conversation.key, "session:herdr:claude:id:sess-1")
@@ -179,11 +293,11 @@ class QueueOperationTests(unittest.TestCase):
         self.assertTrue(pq.clear_pending(self.queue(), entry["id"]))
         self.assertEqual(pq.consume_pending(self.data, "w1:p1", 100, conversation_key=self.conversation.key), [])
 
-    def test_pane_queue_is_adopted_when_session_appears(self):
+    def test_pane_queue_can_be_adopted_explicitly(self):
         bare = pq.conversation_for_pane(claude_pane(session=None))
         pq.add_entry(self.data, bare, "queued before session")
         pq.add_entry(self.data, self.conversation, "already here")
-        self.assertEqual(pq.adopt_pane_queue(self.data, self.conversation), 1)
+        self.assertEqual(pq.merge_queue(self.data, bare.key, self.conversation), 1)
         self.assertNotIn("pane:w1:p1", self.data["queues"])
         self.assertEqual(self.texts(), ["already here", "queued before session"])
 
@@ -217,6 +331,90 @@ class CommandTestCase(unittest.TestCase):
 
 
 class CommandTests(CommandTestCase):
+    def test_codex_working_after_idle_switch_retains_old_unsent_insert(self):
+        other = "01a14008-062c-7a10-888f-81da2f6fbcfb"
+        self.fake.codex_lock_ids.append(other)
+        self.fake.panes_by_id["w1:p1"] = codex_pane()
+        key = "session:herdr:codex:id:" + CODEX_SESSION
+        with mock.patch.object(pq, "input_runtime", return_value={"boot": "same", "socket": "same"}):
+            self.run_cli("add", "--pane", "w1:p1", "not submitted in A")
+            entry = pq.Store(self.state).read()["queues"][key]["entries"][0]
+            self.run_cli("insert", "--pane", "w1:p1", entry["id"])
+            self.fake.panes_by_id["w1:p1"] = codex_pane(other[:29] + "... | project")
+            event = {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": "working"}}
+            with mock.patch.object(pq.time, "time", return_value=time.time() + 10):
+                self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+            queue = pq.Store(self.state).read()["queues"][key]
+            self.assertEqual([e["text"] for e in queue["entries"]], ["not submitted in A"])
+            self.assertNotIn("pending", queue["entries"][0])
+            self.assertEqual(queue["history"], [])
+            self.assertEqual(self.fake.calls[-1], ("count", "w1:p1", 0))
+            self.fake.panes_by_id["w1:p1"] = codex_pane()
+            with mock.patch.object(pq.time, "time", return_value=time.time() + 20):
+                self.run_cli("hook", env={"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)})
+            self.assertEqual(pq.Store(self.state).read()["queues"][key]["history"], [])
+
+    def test_codex_new_content_uses_unresolved_queue_when_native_binding_is_stale(self):
+        self.fake.panes_by_id["w1:p1"] = codex_pane()
+        self.run_cli("add", "--pane", "w1:p1", "original A")
+        key = "session:herdr:codex:id:" + CODEX_SESSION
+        old_queue = pq.Store(self.state).read()["queues"][key]
+        other = "01a14008-062c-7a10-888f-81da2f6fbcfb"
+        self.fake.codex_lock_ids.append(other)
+        self.fake.panes_by_id["w1:p1"] = codex_pane(other[:29] + "... | project")
+        self.run_cli("add", "--pane", "w1:p1", "new text after switch")
+        queues = pq.Store(self.state).read()["queues"]
+        self.assertEqual(queues[key], old_queue)
+        self.assertEqual(queues["pane:w1:p1"]["entries"][0]["text"], "new text after switch")
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        self.assertEqual(app.conversation.key, "pane:w1:p1")
+        self.assertEqual(app.entries[0]["text"], "new text after switch")
+
+    def test_unbound_queue_is_preserved_when_native_binding_appears(self):
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session=None)
+        self.run_cli("add", "--pane", "w1:p1", "unknown owner")
+        before = pq.Store(self.state).read()["queues"]["pane:w1:p1"]
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="replacement")
+        self.run_cli("startup")
+        self.run_cli("add", "--pane", "w1:p1", "known owner")
+        queues = pq.Store(self.state).read()["queues"]
+        self.assertEqual(queues["pane:w1:p1"], before)
+        self.assertEqual([e["text"] for e in queues["session:herdr:claude:id:replacement"]["entries"]],
+                         ["known owner"])
+        self.assertFalse(any(c[0] in ("paste", "submit") for c in self.fake.calls))
+
+    def test_cli_delivery_refuses_a_changed_or_missing_native_identity(self):
+        self.run_cli("add", "--pane", "w1:p1", "keep queued")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        before = (self.state / "queues.json").read_bytes()
+        for command in ("insert", "send"):
+            for session in (None, "replacement"):
+                with self.subTest(command=command, session=session):
+                    self.fake.calls.clear()
+                    with mock.patch.object(self.fake, "pane", side_effect=[claude_pane(), claude_pane(session=session)]):
+                        self.assertEqual(self.run_cli(command, "--pane", "w1:p1", entry["id"]), 1)
+                    self.assertEqual((self.state / "queues.json").read_bytes(), before)
+                    self.assertFalse(any(c[0] in ("paste", "submit") for c in self.fake.calls))
+
+    def test_cli_delivery_refuses_an_unbound_queue(self):
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session=None)
+        self.run_cli("add", "--pane", "w1:p1", "unknown owner")
+        entry = pq.Store(self.state).read()["queues"]["pane:w1:p1"]["entries"][0]
+        before = (self.state / "queues.json").read_bytes()
+        for command in ("insert", "send"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_cli(command, "--pane", "w1:p1", entry["id"]), 1)
+                self.assertEqual((self.state / "queues.json").read_bytes(), before)
+        self.assertFalse(any(c[0] in ("paste", "submit") for c in self.fake.calls))
+
+    def test_same_native_session_can_deliver_after_moving_to_another_repository_pane(self):
+        self.run_cli("add", "--pane", "w1:p1", "same owner")
+        entry = pq.Store(self.state).read()["queues"]["session:herdr:claude:id:sess-1"]["entries"][0]
+        self.fake.panes_by_id = {"w9:p2": {**claude_pane("w9:p2"), "cwd": "/repo/another"}}
+        self.assertEqual(self.run_cli("insert", "--pane", "w9:p2", entry["id"]), 0)
+        self.assertIn(("paste", "w9:p2", "same owner"), self.fake.calls)
+
     def test_add_insert_then_working_event_consumes_entry(self):
         self.assertEqual(self.run_cli("add", "--pane", "w1:p1", "review", "the", "diff"), 0)
         self.run_cli("add", "--pane", "w1:p1", "then", "ship")
@@ -398,6 +596,167 @@ class CommandTests(CommandTestCase):
         self.assertEqual(self.queue_texts(), ["legacy unsent prompt"])
 
 
+class DeliveryTransitionTests(CommandTestCase):
+    def test_server_rejection_or_missing_capability_preserves_ui_and_cli_queues(self):
+        app = self.app_with_entry()
+        entry_id = app.entries[0]["id"]
+        before = (self.state / "queues.json").read_bytes()
+        client = REAL_HERDR("unused")
+        app.herdr = client
+        with mock.patch.object(client, "pane", return_value=claude_pane()):
+            for code in ("agent_session_changed", "unknown_method"):
+                for command, method in (("insert", "pane.send_input_checked"), ("send", "agent.prompt_checked")):
+                    for surface in ("ui", "cli"):
+                        with self.subTest(code=code, command=command, surface=surface):
+                            with mock.patch.object(client, "request", side_effect=pq.HerdrError(code, "test refusal")) as request:
+                                if surface == "ui":
+                                    self.assertFalse(getattr(app, command)())
+                                else:
+                                    with mock.patch.object(pq, "Herdr", return_value=client):
+                                        self.assertEqual(self.run_cli(command, "--pane", "w1:p1", entry_id), 1)
+                                self.assertEqual(request.call_count, 1)
+                                self.assertEqual(request.call_args.args[0], method)
+                            self.assertEqual((self.state / "queues.json").read_bytes(), before)
+
+    def test_codex_ambiguous_title_prefix_never_assigns_native_ownership(self):
+        self.fake.panes_by_id["w1:p1"] = codex_pane(CODEX_SESSION[:29] + "... | project")
+        self.fake.codex_lock_ids.append(CODEX_SESSION[:-1] + "c")
+        self.run_cli("add", "--pane", "w1:p1", "unresolved collision")
+        self.assertEqual(set(pq.Store(self.state).read()["queues"]), {"pane:w1:p1"})
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        self.assertFalse(app.insert())
+        self.assertFalse(app.send())
+
+    def test_popup_add_and_edit_after_switch_keep_original_queue_unchanged(self):
+        app = self.app_with_entry()
+        original = pq.Store(self.state).read()["queues"][app.conversation.key]
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="replacement")
+        with mock.patch.object(app, "with_editor", return_value="new unassigned prompt"):
+            app.add(None)
+        with mock.patch.object(app, "with_editor", return_value="edited unassigned prompt"):
+            app.edit(None)
+        queues = pq.Store(self.state).read()["queues"]
+        self.assertEqual(queues[app.conversation.key], original)
+        self.assertEqual([e["text"] for e in queues["pane:w1:p1"]["entries"]],
+                         ["new unassigned prompt", "edited unassigned prompt"])
+
+    def test_editor_owner_loss_stays_unassigned_after_original_session_returns(self):
+        app = self.app_with_entry()
+        original = pq.Store(self.state).read()["queues"][app.conversation.key]
+        app.editor_unassigned = True
+        with mock.patch.object(app, "with_editor", return_value="saved after switching away and back"):
+            app.edit(None)
+        queues = pq.Store(self.state).read()["queues"]
+        self.assertEqual(queues[app.conversation.key], original)
+        self.assertEqual(queues["pane:w1:p1"]["entries"][0]["text"], "saved after switching away and back")
+
+    def test_codex_delivery_requires_a_matching_managed_session_title(self):
+        for title in (CODEX_SESSION + " | project", CODEX_SESSION[:29] + "... | project",
+                      "⠋ " + CODEX_SESSION[:29] + "... | project",
+                      "⠋ | " + CODEX_SESSION[:29] + "... | project"):
+            for field in ("terminal_title_stripped", "terminal_title"):
+                with self.subTest(title=title, field=field):
+                    pane = codex_pane(title)
+                    pane[field] = pane.pop("terminal_title_stripped")
+                    fake = FakeHerdr([pane])
+                    self.assertEqual(pq.delivery_conversation(fake, pq.resolved_conversation(fake, pane)).session["value"],
+                                     CODEX_SESSION)
+
+    def test_codex_popup_refuses_missing_or_stale_title_even_if_binding_is_unchanged(self):
+        self.fake.panes_by_id["w1:p1"] = codex_pane()
+        self.run_cli("add", "--pane", "w1:p1", "owned Codex prompt")
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        before = (self.state / "queues.json").read_bytes()
+        self.fake.calls.clear()
+        for title in ("project", "", "01a14008-062c-7a10-888f-81da2... | project",
+                      CODEX_SESSION[:29] + " | project", "project | " + CODEX_SESSION):
+            with self.subTest(title=title):
+                self.fake.panes_by_id["w1:p1"] = codex_pane(title)
+                self.assertFalse(app.insert())
+                self.assertFalse(app.send())
+                self.assertEqual((self.state / "queues.json").read_bytes(), before)
+                self.assertEqual(self.fake.calls, [])
+
+    def test_codex_cli_refuses_unchanged_binding_with_switched_title(self):
+        self.fake.panes_by_id["w1:p1"] = codex_pane()
+        self.run_cli("add", "--pane", "w1:p1", "owned Codex prompt")
+        queue = pq.Store(self.state).read()["queues"]["session:herdr:codex:id:" + CODEX_SESSION]
+        before = (self.state / "queues.json").read_bytes()
+        for command in ("insert", "send"):
+            with self.subTest(command=command):
+                self.fake.calls.clear()
+                with mock.patch.object(self.fake, "pane", side_effect=[
+                        codex_pane(), codex_pane("01a14008-062c-7a10-888f-81da2... | project")]):
+                    self.assertEqual(self.run_cli(command, "--pane", "w1:p1", queue["entries"][0]["id"]), 1)
+                self.assertEqual((self.state / "queues.json").read_bytes(), before)
+                self.assertEqual(self.fake.calls, [])
+
+    def app_with_entry(self, session="sess-1"):
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session=session)
+        self.run_cli("add", "--pane", "w1:p1", "owned prompt")
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        self.fake.calls.clear()
+        return app
+
+    def test_popup_refuses_replacement_unbound_exited_and_missing_panes(self):
+        app = self.app_with_entry()
+        before = (self.state / "queues.json").read_bytes()
+        replacements = [claude_pane(session="replacement"), claude_pane(session=None),
+                        {**claude_pane(), "agent": None}, None]
+        for replacement in replacements:
+            if replacement is None:
+                self.fake.panes_by_id.clear()
+            else:
+                self.fake.panes_by_id["w1:p1"] = replacement
+            for action in (app.insert, app.send):
+                with self.subTest(replacement=replacement, action=action.__name__):
+                    self.assertFalse(action())
+                    self.assertEqual((self.state / "queues.json").read_bytes(), before)
+                    self.assertFalse(any(c[0] in ("paste", "submit") for c in self.fake.calls))
+
+    def test_popup_refuses_delivery_of_unbound_entries_after_binding_appears(self):
+        app = self.app_with_entry(session=None)
+        self.fake.panes_by_id["w1:p1"] = claude_pane()
+        before = (self.state / "queues.json").read_bytes()
+        self.assertFalse(app.insert())
+        self.assertFalse(app.send())
+        self.assertEqual((self.state / "queues.json").read_bytes(), before)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_popup_native_identity_survives_a_directory_change(self):
+        app = self.app_with_entry()
+        self.fake.panes_by_id["w1:p1"] = {**claude_pane(), "cwd": "/repo/other"}
+        self.assertTrue(app.insert())
+        self.assertIn(("paste", "w1:p1", "owned prompt"), self.fake.calls)
+        self.assertTrue(app.send())
+        self.assertIn(("submit", "w1:p1", "owned prompt", True), self.fake.calls)
+
+    def test_popup_keeps_unbound_entries_separate_until_explicit_adoption(self):
+        self.app_with_entry(session=None)
+        self.fake.panes_by_id["w1:p1"] = claude_pane()
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        self.assertEqual(app.entries, [])
+        self.assertEqual(app.others[0][0], "pane:w1:p1")
+        app.adopt_other()
+        self.assertEqual([e["text"] for e in app.entries], ["owned prompt"])
+        self.assertNotIn("pane:w1:p1", pq.Store(self.state).read()["queues"])
+
+    def test_explicit_adoption_refuses_a_stale_target_conversation(self):
+        self.app_with_entry(session=None)
+        self.fake.panes_by_id["w1:p1"] = claude_pane()
+        app = pq.QueueApp(pq.Store(self.state), self.fake, "w1:p1")
+        app.load()
+        before = (self.state / "queues.json").read_bytes()
+        self.fake.panes_by_id["w1:p1"] = claude_pane(session="replacement")
+        with self.assertRaises(pq.QueueError):
+            app.adopt_other()
+        self.assertEqual((self.state / "queues.json").read_bytes(), before)
+
+
 class ConversationEndedTests(CommandTestCase):
     def event(self, name, **data):
         return {"HERDR_PLUGIN_EVENT_JSON": json.dumps({"event": name, "data": {"pane_id": "w1:p1", **data}})}
@@ -512,6 +871,41 @@ class EditBufferTests(unittest.TestCase):
 
 
 class DraftRecoveryTests(unittest.TestCase):
+    def test_changed_editor_owner_preserves_original_and_recovers_unassigned_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            conversation = pq.conversation_for_pane(claude_pane())
+            with store.transaction() as data:
+                entry = pq.add_entry(data, conversation, "original prompt")
+            draft = pq.DraftFile(store, conversation, "original prompt", entry["id"])
+            draft.unassign("w1:p1")
+            draft.save("edited after owner changed", time.time(), force=True)
+            with mock.patch.object(pq, "draft_owner_alive", return_value=False):
+                self.assertEqual(pq.recover_unassigned_drafts(store), 1)
+            queues = store.read()["queues"]
+            self.assertEqual(queues[conversation.key]["entries"][0]["text"], "original prompt")
+            self.assertEqual(queues["pane:w1:p1"]["entries"][0]["text"], "edited after owner changed")
+
+    def test_unbound_draft_recovers_to_original_pane_queue_after_binding_appears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = pq.Store(pathlib.Path(tmp))
+            drafts = pq.drafts_dir(store)
+            drafts.mkdir()
+            (drafts / "unassigned.md").write_text("unknown owner draft")
+            (drafts / "unassigned.json").write_text(json.dumps({
+                "key": "pane:w1:p1", "pid": 2**30, "entry_id": None, "initial": ""}))
+            fake = FakeHerdr([claude_pane()])
+            pq.sync_pane(store, fake, claude_pane())
+            queues = store.read()["queues"]
+            self.assertEqual([e["text"] for e in queues["pane:w1:p1"]["entries"]], ["unknown owner draft"])
+            self.assertNotIn("session:herdr:claude:id:sess-1", queues)
+            app = pq.QueueApp(store, fake, "w1:p1")
+            app.load()
+            self.assertEqual(app.others[0][0], "pane:w1:p1")
+            self.assertEqual(app.entries, [])
+            self.assertFalse(any(c[0] in ("paste", "submit") for c in fake.calls))
+            self.assertEqual(list(drafts.iterdir()), [])
+
     def test_recovered_edit_preserves_a_newer_queue_edit_and_both_versions(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = pq.Store(pathlib.Path(tmp))

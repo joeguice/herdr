@@ -1,6 +1,6 @@
 id = "joeguice.prompt-queue"
 name = "Prompt queue"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.9.3"
 description = "Queue prompts per agent conversation and insert them into the prompt later"
 platforms = ["linux", "macos"]
@@ -14,6 +14,14 @@ id = "open"
 title = "Open prompt queue"
 contexts = ["pane"]
 command = ["python3", "prompt_queue.py", "open"]
+
+# Safe for a binding reconciler to refresh recovery/counts after an idle change.
+# This action neither pastes nor submits queued entries.
+[[actions]]
+id = "reconcile"
+title = "Refresh recovered queues"
+contexts = ["pane"]
+command = ["python3", "prompt_queue.py", "startup"]
 
 [[panes]]
 id = "queue"

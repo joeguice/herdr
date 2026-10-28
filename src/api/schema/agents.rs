@@ -258,3 +258,11 @@ pub struct AgentSessionInfo {
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptCheckedParams {
+    pub target: String,
+    pub text: String,
+    #[serde(flatten)]
+    pub expected: super::panes::PaneSessionExpectation,
+}
