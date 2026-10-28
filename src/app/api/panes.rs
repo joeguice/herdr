@@ -2856,24 +2856,14 @@ mod tests {
                 resume_argv: None,
             },
         );
-        app.state
-            .terminals
-            .get_mut(&tid)
-            .unwrap()
-            .set_hook_authority(
-                "foreign".into(),
-                "codex".into(),
-                AgentState::Idle,
-                None,
-                None,
-            );
-        assert_eq!(
-            app.state.terminals[&tid]
-                .hook_authority
-                .as_ref()
-                .unwrap()
-                .source,
-            "foreign"
+        // Simulate an imported legacy authority masking the persisted native ID.
+        // Normal ownership checks prevent new hooks from creating this shape.
+        app.state.terminals.get_mut(&tid).unwrap().hook_authority = Some(
+            serde_json::from_value(serde_json::json!({
+                "source": "foreign", "agent_label": "codex", "state": AgentState::Idle,
+                "message": null, "session_ref": null,
+            }))
+            .unwrap(),
         );
         let denied = app.handle_pane_clear_agent_session(
             "deny".into(),
