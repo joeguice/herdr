@@ -151,6 +151,7 @@ operations::define_operations! {
     PaneSendInputChecked(PaneSendInputCheckedParams) => "pane.send_input_checked", false, false;
     AgentPromptChecked(AgentPromptCheckedParams) => "agent.prompt_checked", true, false;
     PaneReportAgentSessionChecked(PaneReportAgentSessionCheckedParams) => "pane.report_agent_session_checked", true, false;
+    PaneClearInactiveAgentSession(PaneClearInactiveAgentSessionParams) => "pane.clear_inactive_agent_session", true, false;
 }
 
 #[cfg(test)]

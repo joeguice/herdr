@@ -2,12 +2,13 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams,
-    PaneClearAgentSessionParams, PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection,
-    PaneCopySearchParams, PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
-    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
-    PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
-    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
-    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneClearAgentSessionParams, PaneClearInactiveAgentSessionParams, PaneCopyMotion,
+    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
+    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
+    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
+    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
+    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
+    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionCheckedParams,
     PaneReportAgentSessionParams, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
@@ -2091,6 +2092,53 @@ impl App {
                 "native conversation is missing",
             );
         };
+        self.clear_verified_agent_session(id, ws_idx, pane_id, session)
+    }
+
+    pub(super) fn handle_pane_clear_inactive_agent_session(
+        &mut self,
+        id: String,
+        params: PaneClearInactiveAgentSessionParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let expected = params.expected;
+        let Some(session) = expected.expected_agent_session.as_ref() else {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "native conversation is missing",
+            );
+        };
+        if !crate::agent_resume::is_official_agent_source(&session.source, &session.agent)
+            || pane.agent.is_some()
+            || pane.agent_status != crate::api::schema::AgentStatus::Unknown
+            || expected.expected_terminal_id.is_empty()
+            || pane.terminal_id != expected.expected_terminal_id
+            || pane.agent_session != expected.expected_agent_session
+            || pane.terminal_title != expected.expected_terminal_title
+            || pane.revision != params.expected_pane_revision
+        {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "inactive pane or saved native conversation changed",
+            );
+        }
+        self.clear_verified_agent_session(id, ws_idx, pane_id, session)
+    }
+
+    fn clear_verified_agent_session(
+        &mut self,
+        id: String,
+        ws_idx: usize,
+        pane_id: PaneId,
+        session: &crate::api::schema::AgentSessionInfo,
+    ) -> String {
         let updates =
             self.state
                 .clear_agent_session_for_api(pane_id, &session.source, &session.agent);
@@ -2657,6 +2705,56 @@ mod tests {
         assert_eq!(pane.agent.as_deref(), Some("codex"));
         assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
         assert!(app.state.session_dirty);
+    }
+
+    #[tokio::test]
+    async fn inactive_checked_clear_matches_exact_saved_identity() {
+        for changed in ["none", "revision", "session", "terminal", "title", "active"] {
+            let (mut app, pane_id, mut expected, mut rx) = app_with_session_guard();
+            let internal = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0]
+                .terminal_id(internal)
+                .unwrap()
+                .clone();
+            if changed != "active" {
+                app.state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .unwrap()
+                    .set_detected_state(None, AgentState::Unknown);
+            }
+            let pane = app.pane_info(0, internal).unwrap();
+            let mut revision = pane.revision;
+            match changed {
+                "revision" => revision += 1,
+                "session" => {
+                    expected.expected_agent_session.as_mut().unwrap().value = "session-b".into();
+                }
+                "terminal" => expected.expected_terminal_id = "replacement".into(),
+                "title" => expected.expected_terminal_title = Some("different selection".into()),
+                _ => {}
+            }
+            let response = app.handle_pane_clear_inactive_agent_session(
+                "clear-inactive".into(),
+                PaneClearInactiveAgentSessionParams {
+                    pane_id,
+                    expected_pane_revision: revision,
+                    expected,
+                },
+            );
+            let pane = app.pane_info(0, internal).unwrap();
+            if changed == "none" {
+                let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+                assert!(matches!(response.result, ResponseResult::Ok {}));
+                assert!(pane.agent_session.is_none());
+                assert!(app.state.session_dirty);
+            } else {
+                let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+                assert_eq!(response.error.code, "agent_session_changed");
+                assert!(pane.agent_session.is_some());
+            }
+            assert!(rx.try_recv().is_err(), "a checked clear never sends input");
+        }
     }
 
     #[tokio::test]

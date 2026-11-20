@@ -549,6 +549,16 @@ pub struct PaneClearAgentSessionParams {
     pub expected: PaneSessionExpectation,
 }
 
+/// Retire an exact saved native binding after the launcher has observed a
+/// completed exit and the pane no longer has a foreground agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneClearInactiveAgentSessionParams {
+    pub pane_id: String,
+    pub expected_pane_revision: u64,
+    #[serde(flatten)]
+    pub expected: PaneSessionExpectation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendInputCheckedParams {
     pub pane_id: String,
