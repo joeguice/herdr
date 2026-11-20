@@ -2560,6 +2560,44 @@
           ],
           "type": "object"
         },
+        "PaneClearInactiveAgentSessionParams": {
+          "description": "Retire an exact saved native binding after the launcher has observed a\ncompleted exit and the pane no longer has a foreground agent.",
+          "properties": {
+            "expected_agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expected_pane_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "expected_pane_revision",
+            "expected_terminal_id"
+          ],
+          "type": "object"
+        },
         "PaneCopyMotion": {
           "enum": [
             "line_end",
@@ -6561,6 +6599,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneReportAgentSessionCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.clear_inactive_agent_session",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneClearInactiveAgentSessionParams"
             }
           },
           "required": [

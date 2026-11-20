@@ -1207,6 +1207,9 @@ impl App {
             Method::PaneClearAgentSession(params) => {
                 return self.handle_pane_clear_agent_session(request.id, params);
             }
+            Method::PaneClearInactiveAgentSession(params) => {
+                return self.handle_pane_clear_inactive_agent_session(request.id, params);
+            }
             Method::PaneSendInputChecked(params) => {
                 return self.handle_pane_send_input_checked(request.id, params);
             }

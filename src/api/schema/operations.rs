@@ -200,6 +200,7 @@ mod tests {
             "pane.clear_agent_authority",
             "pane.release_agent",
             "pane.clear_agent_session",
+            "pane.clear_inactive_agent_session",
             "pane.close",
             "popup.close",
             "plugin.unlink",
